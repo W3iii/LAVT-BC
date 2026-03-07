@@ -124,12 +124,16 @@ def get_parser():
 
 def get_dataset(split, transform, args):
     from data.dataset_bc import BCDataset
+    # eval_mode=False during training: pick one random sentence per sample
+    # (same as original LAVT train.py). eval_mode=True is only for final test
+    # inference where all sentences are evaluated; it returns 3-D tensors that
+    # BERT cannot directly consume without an extra loop.
     ds = BCDataset(
         args,
         split=split,
         image_transforms=transform,
         target_transforms=None,
-        eval_mode=(split != 'train'),
+        eval_mode=False,
     )
     num_classes = 2
     return ds, num_classes
