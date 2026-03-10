@@ -58,17 +58,6 @@ class BCDataset(data.Dataset):
         self.input_ids    = []
         self.attention_masks = []
 
-        # pre-tokenise the empty string once; added to every sample's pool
-        # so the model occasionally receives no language cue (robustness)
-        _empty_ids    = [0] * self.max_tokens
-        _empty_mask   = [0] * self.max_tokens
-        _empty_tok    = self.tokenizer.encode(text='', add_special_tokens=True)
-        _empty_tok    = _empty_tok[:self.max_tokens]
-        _empty_ids[:len(_empty_tok)]  = _empty_tok
-        _empty_mask[:len(_empty_tok)] = [1] * len(_empty_tok)
-        self._empty_input_ids   = torch.tensor(_empty_ids).unsqueeze(0)
-        self._empty_attn_mask   = torch.tensor(_empty_mask).unsqueeze(0)
-
         for ann in self.annotations:
             sentences_for_ref  = []
             attentions_for_ref = []
@@ -91,10 +80,6 @@ class BCDataset(data.Dataset):
                 attentions_for_ref.append(
                     torch.tensor(attention_mask).unsqueeze(0)
                 )
-
-            # append the empty-string token as an extra candidate
-            sentences_for_ref.append(self._empty_input_ids)
-            attentions_for_ref.append(self._empty_attn_mask)
 
             self.input_ids.append(sentences_for_ref)
             self.attention_masks.append(attentions_for_ref)
@@ -127,10 +112,13 @@ class BCDataset(data.Dataset):
         if self.image_transforms is not None:
             img, mask = self.image_transforms(img, mask)
 
-        # ── sentence embedding: always pick one at random ─────────────────
-        # The pool includes the empty string '' as the last entry, so the
-        # model occasionally receives no language cue (robustness training).
-        choice_sent       = np.random.choice(len(self.input_ids[index]))
+        # ── sentence embedding ────────────────────────────────────────────
+        # train: random pick → data augmentation via language variation
+        # val/test: fixed index 0 → deterministic, stable metric
+        if self.split == 'train':
+            choice_sent = np.random.choice(len(self.input_ids[index]))
+        else:
+            choice_sent = 0
         tensor_embeddings = self.input_ids[index][choice_sent]
         attention_mask    = self.attention_masks[index][choice_sent]
 
