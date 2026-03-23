@@ -21,6 +21,7 @@ Example:
 """
 
 import os
+import json
 import numpy as np
 import torch
 import torch.utils.data
@@ -63,6 +64,12 @@ def computeIoU(pred_seg, gd_seg):
     return I, U
 
 
+def computeDice(pred_seg, gd_seg):
+    I = np.sum(np.logical_and(pred_seg, gd_seg))
+    denom = np.sum(pred_seg) + np.sum(gd_seg)
+    return (2 * I / denom) if denom > 0 else 0.0
+
+
 # ── evaluate ──────────────────────────────────────────────────────────────────
 
 def evaluate(model, data_loader, bert_model, device, all_sentences,
@@ -87,9 +94,11 @@ def evaluate(model, data_loader, bert_model, device, all_sentences,
     seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
     seg_total = 0
     mean_IoU = []
+    mean_Dice = []
 
-    # per-sentence IoU accumulation: {sent_idx: [iou, ...]}
-    sent_iou_dict = {}
+    # per-sentence IoU/Dice accumulation: {sent_idx: [value, ...]}
+    sent_iou_dict  = {}
+    sent_dice_dict = {}
 
     with torch.no_grad():
         for idx, data in enumerate(metric_logger.log_every(data_loader, 100, header)):
@@ -113,14 +122,17 @@ def evaluate(model, data_loader, bert_model, device, all_sentences,
 
                 output_mask = output.cpu().argmax(1).numpy()
                 I, U = computeIoU(output_mask, target)
-                this_iou = (I / U) if U > 0 else 0.0
+                this_iou  = (I / U) if U > 0 else 0.0
+                this_dice = computeDice(output_mask, target)
                 mean_IoU.append(this_iou)
+                mean_Dice.append(this_dice)
                 cum_I += I
                 cum_U += U
                 for n, eval_iou in enumerate(eval_seg_iou_list):
                     seg_correct[n] += (this_iou >= eval_iou)
                 seg_total += 1
                 sent_iou_dict.setdefault(sent_idx, []).append(this_iou)
+                sent_dice_dict.setdefault(sent_idx, []).append(this_dice)
 
                 # ── save prediction PNG ───────────────────────────────────
                 if save_pred and output_dir is not None and dataset is not None:
@@ -144,22 +156,17 @@ def evaluate(model, data_loader, bert_model, device, all_sentences,
                     gt_bin   = (np.array(gt_pil) > 0)                   # H×W bool
                     pred_bin = (output_mask[0] > 0)                     # H×W bool
 
-                    def overlay_red(gray, mask, alpha=0.45):
-                        """Overlay red on a grayscale array where mask==True."""
+                    def overlay_color(gray, mask, color, alpha=0.45):
+                        """Overlay a colour (R,G,B) on a grayscale array where mask==True."""
                         rgb = np.stack([gray, gray, gray], axis=-1).copy()
-                        rgb[mask, 0] = np.clip(
-                            gray[mask].astype(np.float32) * (1 - alpha) + 255 * alpha, 0, 255
-                        ).astype(np.uint8)
-                        rgb[mask, 1] = np.clip(
-                            gray[mask].astype(np.float32) * (1 - alpha), 0, 255
-                        ).astype(np.uint8)
-                        rgb[mask, 2] = np.clip(
-                            gray[mask].astype(np.float32) * (1 - alpha), 0, 255
-                        ).astype(np.uint8)
+                        for ch, val in enumerate(color):
+                            rgb[mask, ch] = np.clip(
+                                gray[mask].astype(np.float32) * (1 - alpha) + val * alpha, 0, 255
+                            ).astype(np.uint8)
                         return rgb
 
-                    left  = overlay_red(orig_arr, gt_bin)    # GT overlay
-                    right = overlay_red(orig_arr, pred_bin)  # Pred overlay
+                    left  = overlay_color(orig_arr, gt_bin,   color=(0, 255, 0))   # GT   → green
+                    right = overlay_color(orig_arr, pred_bin, color=(255, 0, 0))   # Pred → red
 
                     # 2-column: GT overlay | Pred overlay
                     canvas = np.concatenate([left, right], axis=1)
@@ -172,28 +179,57 @@ def evaluate(model, data_loader, bert_model, device, all_sentences,
 
             del image, target
 
-    mean_IoU = np.array(mean_IoU)
-    mIoU = np.mean(mean_IoU)
+    mean_IoU  = np.array(mean_IoU)
+    mean_Dice = np.array(mean_Dice)
+    mIoU  = float(np.mean(mean_IoU))
+    mDice = float(np.mean(mean_Dice))
+    overall_iou = cum_I / cum_U if cum_U > 0 else 0.0
+
     print('Final results:')
-    print('  Mean IoU : %.2f%%' % (mIoU * 100.))
+    print('  Mean IoU  : %.2f%%' % (mIoU  * 100.))
+    print('  Mean Dice : %.2f%%' % (mDice * 100.))
     results_str = ''
     for n, eval_iou in enumerate(eval_seg_iou_list):
         results_str += '    precision@%.1f = %.2f%%\n' % (
             eval_iou, seg_correct[n] * 100. / seg_total
         )
-    results_str += '    overall IoU = %.2f%%\n' % (cum_I * 100. / cum_U)
+    results_str += '    overall IoU = %.2f%%\n' % (overall_iou * 100.)
     print(results_str)
 
     # ── per-sentence breakdown ────────────────────────────────────────────
-    print('Per-sentence mean IoU:')
+    print('Per-sentence mean IoU / Dice:')
     best_sent, best_iou = -1, -1.0
+    per_sentence = {}
     for s_idx in sorted(sent_iou_dict.keys()):
-        s_mean = np.mean(sent_iou_dict[s_idx]) * 100.
-        print(f'  s{s_idx}: {s_mean:.2f}%')
-        if s_mean > best_iou:
-            best_iou  = s_mean
+        s_iou  = float(np.mean(sent_iou_dict[s_idx]))
+        s_dice = float(np.mean(sent_dice_dict[s_idx]))
+        print(f'  s{s_idx}: IoU={s_iou*100:.2f}%  Dice={s_dice*100:.2f}%')
+        per_sentence[f's{s_idx}'] = {'mean_iou': round(s_iou, 6),
+                                     'mean_dice': round(s_dice, 6)}
+        if s_iou > best_iou:
+            best_iou  = s_iou
             best_sent = s_idx
-    print(f'\n  >> Best sentence: s{best_sent}  (mean IoU = {best_iou:.2f}%)')
+    print(f'\n  >> Best sentence: s{best_sent}  (mean IoU = {best_iou*100:.2f}%)')
+
+    # ── save JSON ─────────────────────────────────────────────────────────
+    results = {
+        'mean_iou':    round(mIoU,  6),
+        'mean_dice':   round(mDice, 6),
+        'overall_iou': round(overall_iou, 6),
+        'precision': {
+            f'@{eval_iou}': round(seg_correct[n] / seg_total, 6)
+            for n, eval_iou in enumerate(eval_seg_iou_list)
+        },
+        'per_sentence': per_sentence,
+    }
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(output_dir, 'results.json')
+    else:
+        json_path = 'results.json'
+    with open(json_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f'\nResults saved to: {json_path}')
 
 
 # ── argument parsing ──────────────────────────────────────────────────────────

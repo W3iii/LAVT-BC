@@ -3,7 +3,7 @@ python test_bc.py ^
     --model_id lavt_bc ^
     --bc_dataset_root ../dataset ^
     --split test ^
-    --resume ./checkpoints/bc_pos_480/model_best_lavt_bc.pth ^
+    --resume ./checkpoints/bc_pos_480_augment/model_best_lavt_bc.pth ^
     --swin_type base ^
     --window12 ^
     --img_size 480 ^
