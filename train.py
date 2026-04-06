@@ -90,6 +90,11 @@ def get_parser():
     parser.add_argument('--ck_bert', default='bert-base-uncased',
                         help='pre-trained BERT weights')
 
+    # ── sampling ──
+    parser.add_argument('--neg_ratio', default=2.0, type=float,
+                        help='max negatives = neg_ratio × num_positives '
+                             '(train only, 0 = keep all)')
+
     # ── training hyper-params ──
     parser.add_argument('--epochs', default=40, type=int)
     parser.add_argument('-b', '--batch-size', default=4, type=int)
@@ -98,6 +103,8 @@ def get_parser():
     parser.add_argument('--wd', '--weight-decay', default=1e-2, type=float,
                         metavar='W', dest='weight_decay')
     parser.add_argument('--amsgrad', action='store_true')
+    parser.add_argument('--early_stop', default=10, type=int,
+                        help='stop training after N epochs without val IoU improvement')
 
     # ── I/O ──
     parser.add_argument('--output-dir', default='./checkpoints/ln/')
@@ -225,20 +232,73 @@ def dice_loss(input, target, smooth=1.0):
     return 1.0 - dice.mean()
 
 
-def focal_loss(input, target, alpha=0.25, gamma=2.0):
-    """Focal Loss for binary segmentation (2-class softmax output)."""
+def focal_loss(input, target, alpha=0.75, gamma=2.0):
+    """
+    Focal Loss for binary segmentation (2-class softmax output).
+    alpha = weight for foreground (class 1), (1-alpha) for background (class 0).
+    For rare foreground like lung nodules, alpha > 0.5 upweights foreground.
+    """
     ce = nn.functional.cross_entropy(input, target, reduction='none')  # (B, H, W)
     prob = torch.softmax(input, dim=1)                                 # (B, 2, H, W)
     # p_t = probability of the ground-truth class
     p_t = prob.gather(1, target.unsqueeze(1)).squeeze(1)               # (B, H, W)
-    focal_weight = alpha * (1.0 - p_t) ** gamma
+    # class-specific alpha: foreground=alpha, background=1-alpha
+    alpha_t = torch.where(target == 1, alpha, 1.0 - alpha)
+    focal_weight = alpha_t * (1.0 - p_t) ** gamma
     return (focal_weight * ce).mean()
 
 
-def criterion(input, target):
-    fl   = focal_loss(input, target, alpha=0.25, gamma=2.0)
-    dice = dice_loss(input, target)
-    return fl + dice
+# per-category loss weight: upweight rare/small categories
+CLS_LOSS_WEIGHT = {0: 1.0, 1: 2.0, 2: 1.5, 3: 1.0, 4: 1.0}
+
+
+def criterion(input, target, category=None, neg_fp_weight=3.0):
+    """
+    Positive samples (has foreground): BCE + Dice + Focal, weighted by category
+    Negative samples (all background): BCE with heavier false-positive penalty
+    Fully vectorized — no per-sample loop.
+    """
+    B = input.shape[0]
+    neg_class_weight = torch.tensor([1.0, neg_fp_weight], device=input.device)
+
+    # mask: which samples are positive
+    has_fg = target.flatten(1).sum(1) > 0  # (B,) bool
+
+    # per-pixel BCE for all samples
+    bce_per_sample = nn.functional.cross_entropy(
+        input, target, reduction='none'
+    ).mean(dim=(1, 2))  # (B,)
+
+    # per-pixel BCE (with class weight) for negative samples
+    bce_neg_per_sample = nn.functional.cross_entropy(
+        input, target, weight=neg_class_weight, reduction='none'
+    ).mean(dim=(1, 2))  # (B,)
+
+    # per-sample category loss weight
+    if category is not None:
+        cls_w = torch.ones(B, device=input.device)
+        for cat, w in CLS_LOSS_WEIGHT.items():
+            cls_w[category == cat] = w
+    else:
+        cls_w = torch.ones(B, device=input.device)
+
+    if has_fg.any():
+        pos_input  = input[has_fg]
+        pos_target = target[has_fg]
+        dice = dice_loss(pos_input, pos_target)
+        fl   = focal_loss(pos_input, pos_target, alpha=0.75, gamma=2.0)
+
+        # weighted positive per-sample BCE
+        pos_bce = (bce_per_sample[has_fg] * cls_w[has_fg]).sum() / cls_w[has_fg].sum()
+        pos_loss = pos_bce + dice + fl
+
+        neg_loss = bce_neg_per_sample[~has_fg].mean() if (~has_fg).any() else 0.0
+
+        n_pos = has_fg.sum().float()
+        n_neg = (~has_fg).sum().float()
+        return (pos_loss * n_pos + neg_loss * n_neg) / (n_pos + n_neg)
+    else:
+        return bce_neg_per_sample.mean()
 
 
 # ── IoU ───────────────────────────────────────────────────────────────────────
@@ -256,7 +316,7 @@ def IoU(pred, gt):
 
 # ── evaluation ────────────────────────────────────────────────────────────────
 
-def evaluate(model, data_loader, bert_model, dataset_val=None):
+def evaluate(model, data_loader, bert_model):
     """
     Evaluate on validation set.
     Metrics are computed ONLY on positive samples (is_pos=1) where
@@ -280,12 +340,13 @@ def evaluate(model, data_loader, bert_model, dataset_val=None):
     neg_total   = 0
     neg_correct = 0  # true negatives: model predicts no foreground
 
-    annotations = dataset_val.annotations if dataset_val is not None else None
+    # per-category positive metrics
+    cat_ious = {1: [], 2: [], 3: [], 4: []}
 
     with torch.no_grad():
-        for idx, data in enumerate(metric_logger.log_every(data_loader, 100, header)):
+        for data in metric_logger.log_every(data_loader, 100, header):
             total_its += 1
-            image, target, sentences, attentions = data
+            image, target, sentences, attentions, meta = data
             image     = image.cuda(non_blocking=True)
             target    = target.cuda(non_blocking=True)
             sentences = sentences.cuda(non_blocking=True)
@@ -304,7 +365,8 @@ def evaluate(model, data_loader, bert_model, dataset_val=None):
             else:
                 output = model(image, sentences, l_mask=attentions)
 
-            is_pos = annotations[idx]['is_pos'] if annotations else 1
+            is_pos = meta['is_pos'].item()
+            cat    = meta['category'].item()
 
             if is_pos == 1:
                 iou, I, U = IoU(output, target)
@@ -315,6 +377,8 @@ def evaluate(model, data_loader, bert_model, dataset_val=None):
                 for n_eval_iou, eval_seg_iou in enumerate(eval_seg_iou_list):
                     seg_correct[n_eval_iou] += (iou >= eval_seg_iou)
                 seg_total += 1
+                if cat in cat_ious:
+                    cat_ious[cat].append(iou)
             else:
                 # negative: model should predict all background
                 pred = output.cpu().argmax(1)
@@ -342,7 +406,15 @@ def evaluate(model, data_loader, bert_model, dataset_val=None):
             seg_correct[n_eval_iou] * 100. / max(seg_total, 1),
         )
     results_str += '    overall IoU = %.2f%%\n' % (overall * 100.)
-    results_str += f'  Negative samples: {neg_total}  TN rate: {tn_rate*100:.2f}%'
+    results_str += f'  Negative samples: {neg_total}  TN rate: {tn_rate*100:.2f}%\n'
+    cat_names = {1: 'benign', 2: 'prob_benign', 3: 'prob_suspicious', 4: 'suspicious'}
+    results_str += '  Per-category IoU:\n'
+    for cat in [1, 2, 3, 4]:
+        if cat_ious[cat]:
+            c_iou = np.mean(cat_ious[cat])
+            results_str += f'    cls{cat} ({cat_names[cat]}): {c_iou*100:.2f}% (n={len(cat_ious[cat])})\n'
+        else:
+            results_str += f'    cls{cat} ({cat_names[cat]}): N/A\n'
     print(results_str)
 
     return 100 * iou, 100 * overall
@@ -361,7 +433,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
 
     for data in metric_logger.log_every(data_loader, print_freq, header):
         total_its += 1
-        image, target, sentences, attentions = data
+        image, target, sentences, attentions, meta = data
         image     = image.cuda(non_blocking=True)
         target    = target.cuda(non_blocking=True)
         sentences = sentences.cuda(non_blocking=True)
@@ -380,7 +452,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         else:
             output = model(image, sentences, l_mask=attentions)
 
-        loss = criterion(output, target)
+        loss = criterion(output, target, category=meta['category'].cuda())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -392,7 +464,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         metric_logger.update(loss=loss.item(),
                              lr=optimizer.param_groups[0]['lr'])
 
-        del image, target, sentences, attentions, loss, output, data
+        del image, target, sentences, attentions, meta, loss, output, data
         if bert_model is not None:
             del last_hidden_states, embedding
 
@@ -544,10 +616,11 @@ def main(args):
     )
 
     # ── housekeeping ──────────────────────────────────────────────────────
-    start_time   = time.time()
-    iterations   = 0
-    best_oIoU    = -0.1
-    resume_epoch = -999
+    start_time      = time.time()
+    iterations      = 0
+    best_oIoU       = -0.1
+    resume_epoch    = -999
+    patience_counter = 0
 
     if args.resume:
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -566,13 +639,13 @@ def main(args):
             lr_scheduler, epoch, args.print_freq, iterations, bert_model,
         )
 
-        iou, overallIoU = evaluate(model, data_loader_val, bert_model,
-                                   dataset_val=dataset_val)
+        iou, overallIoU = evaluate(model, data_loader_val, bert_model)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
 
         save_checkpoint = best_oIoU < overallIoU
         if save_checkpoint:
             print(f'  → New best epoch: {epoch}')
+            patience_counter = 0
             if single_bert_model is not None:
                 dict_to_save = {
                     'model':        single_model.state_dict(),
@@ -596,6 +669,12 @@ def main(args):
                              f'model_best_{args.model_id}.pth'),
             )
             best_oIoU = overallIoU
+        else:
+            patience_counter += 1
+            print(f'  No improvement for {patience_counter}/{args.early_stop} epochs')
+            if patience_counter >= args.early_stop:
+                print(f'  Early stopping at epoch {epoch}')
+                break
 
     total_time = time.time() - start_time
     print('Training time: {}'.format(

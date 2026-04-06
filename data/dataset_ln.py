@@ -50,7 +50,27 @@ class LNDataset(data.Dataset):
         # ── load annotation JSON ──────────────────────────────────────────
         ann_path = os.path.join(args.ln_dataset_root, 'annotations', f'{split}.json')
         with open(ann_path, 'r') as f:
-            self.annotations = json.load(f)
+            all_annotations = json.load(f)
+
+        # ── downsample negatives (train only) ─────────────────────────────
+        # neg_ratio: max negatives = neg_ratio × num_positives
+        # default 2.0 → at most 2 negatives per 1 positive
+        # val/test: keep all for complete evaluation
+        neg_ratio = getattr(args, 'neg_ratio', 2.0)
+        if split == 'train' and neg_ratio > 0:
+            pos = [a for a in all_annotations if a['is_pos'] == 1]
+            neg = [a for a in all_annotations if a['is_pos'] == 0]
+            max_neg = int(len(pos) * neg_ratio)
+            if len(neg) > max_neg:
+                random.seed(42)
+                neg = random.sample(neg, max_neg)
+            self.annotations = pos + neg
+            random.shuffle(self.annotations)
+            print(f'  [{split}] pos={len(pos)}, neg={len(neg)} '
+                  f'(downsampled from {len(all_annotations) - len(pos)}, '
+                  f'ratio=1:{neg_ratio})')
+        else:
+            self.annotations = all_annotations
 
         self.image_dir = os.path.join(args.ln_dataset_root, 'images', split)
         self.mask_dir  = os.path.join(args.ln_dataset_root, 'masks',  split)
@@ -125,4 +145,9 @@ class LNDataset(data.Dataset):
         tensor_embeddings = self.input_ids[index][choice_sent]
         attention_mask    = self.attention_masks[index][choice_sent]
 
-        return img, mask, tensor_embeddings, attention_mask
+        meta = {
+            'is_pos':   ann['is_pos'],
+            'category': ann.get('category', -1),
+        }
+
+        return img, mask, tensor_embeddings, attention_mask, meta
