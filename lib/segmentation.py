@@ -3,8 +3,9 @@ import torch.nn as nn
 from .mask_predictor import SimpleDecoding
 from .backbone import MultiModalSwinTransformer
 from ._utils import LAVT, LAVTOne
+from .unet import TextConditionedUNet, PlainEncoder, ResNetEncoder
 
-__all__ = ['lavt', 'lavt_one']
+__all__ = ['lavt', 'lavt_one', 'unet_plain', 'unet_resnet50', 'unet_resnet101']
 
 
 # LAVT
@@ -141,3 +142,35 @@ def _load_model_lavt_one(pretrained, args):
 
 def lavt_one(pretrained='', args=None):
     return _load_model_lavt_one(pretrained, args)
+
+
+###############################################
+# Text-conditioned U-Net variants             #
+###############################################
+def _build_unet(encoder, args):
+    if args.mha:
+        mha = [int(a) for a in args.mha.split('-')]
+    else:
+        mha = [1, 1, 1, 1]
+    model = TextConditionedUNet(
+        encoder,
+        lang_dim=768,
+        num_heads_fusion=mha,
+        fusion_drop=args.fusion_drop,
+    )
+    return model
+
+
+def unet_plain(pretrained='', args=None):
+    encoder = PlainEncoder(in_ch=3)
+    return _build_unet(encoder, args)
+
+
+def unet_resnet50(pretrained='', args=None):
+    encoder = ResNetEncoder(depth=50, pretrained=bool(pretrained))
+    return _build_unet(encoder, args)
+
+
+def unet_resnet101(pretrained='', args=None):
+    encoder = ResNetEncoder(depth=101, pretrained=bool(pretrained))
+    return _build_unet(encoder, args)
