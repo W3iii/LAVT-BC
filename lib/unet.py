@@ -172,8 +172,17 @@ class TextConditionedUNet(nn.Module):
         self.dec2 = DecoderBlock(chs[2] + chs[1], chs[1])
         self.dec1 = DecoderBlock(chs[1] + chs[0], chs[0])
 
-        # output: named 'classifier' for compatibility with train.py param grouping
+        # segmentation head: named 'classifier' for compatibility with train.py param grouping
         self.classifier = nn.Conv2d(chs[0], 2, 1)
+
+        # existence head: predicts whether the queried category exists in this slice
+        self.exist_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(chs[0], 1),
+        )
+        # expose for compatibility
+        self.classifier.feat_channels = chs[0]
 
     def forward(self, x, l_feats, l_mask):
         """
@@ -204,9 +213,10 @@ class TextConditionedUNet(nn.Module):
         d2 = self.dec2(d3, e2)
         d1 = self.dec1(d2, e1)
 
-        out = self.classifier(d1)
-        out = F.interpolate(out, size=input_shape, mode='bilinear', align_corners=True)
-        return out
+        seg_out   = self.classifier(d1)
+        seg_out   = F.interpolate(seg_out, size=input_shape, mode='bilinear', align_corners=True)
+        exist_out = self.exist_head(d1).squeeze(-1)  # (B,)
+        return seg_out, exist_out
 
     def _apply_pwam(self, pwam, res_gate, feat, l_feats, l_mask):
         """

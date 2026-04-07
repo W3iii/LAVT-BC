@@ -11,15 +11,23 @@ class _LAVTSimpleDecode(nn.Module):
         super(_LAVTSimpleDecode, self).__init__()
         self.backbone = backbone
         self.classifier = classifier
+        # existence head: predicts whether queried category exists in this slice
+        feat_ch = classifier.feat_channels
+        self.exist_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(feat_ch, 1),
+        )
 
     def forward(self, x, l_feats, l_mask):
         input_shape = x.shape[-2:]
         features = self.backbone(x, l_feats, l_mask)
         x_c1, x_c2, x_c3, x_c4 = features
-        x = self.classifier(x_c4, x_c3, x_c2, x_c1)
-        x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=True)
+        seg, feat = self.classifier(x_c4, x_c3, x_c2, x_c1, return_feat=True)
+        seg = F.interpolate(seg, size=input_shape, mode='bilinear', align_corners=True)
+        exist_out = self.exist_head(feat).squeeze(-1)  # (B,)
 
-        return x
+        return seg, exist_out
 
 
 class LAVT(_LAVTSimpleDecode):
@@ -36,6 +44,12 @@ class _LAVTOneSimpleDecode(nn.Module):
         self.classifier = classifier
         self.text_encoder = BertModel.from_pretrained(args.ck_bert)
         self.text_encoder.pooler = None
+        feat_ch = classifier.feat_channels
+        self.exist_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(feat_ch, 1),
+        )
 
     def forward(self, x, text, l_mask):
         input_shape = x.shape[-2:]
@@ -46,10 +60,11 @@ class _LAVTOneSimpleDecode(nn.Module):
         ##########################
         features = self.backbone(x, l_feats, l_mask)
         x_c1, x_c2, x_c3, x_c4 = features
-        x = self.classifier(x_c4, x_c3, x_c2, x_c1)
-        x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=True)
+        seg, feat = self.classifier(x_c4, x_c3, x_c2, x_c1, return_feat=True)
+        seg = F.interpolate(seg, size=input_shape, mode='bilinear', align_corners=True)
+        exist_out = self.exist_head(feat).squeeze(-1)  # (B,)
 
-        return x
+        return seg, exist_out
 
 
 class LAVTOne(_LAVTOneSimpleDecode):

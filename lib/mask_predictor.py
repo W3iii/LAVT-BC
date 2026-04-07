@@ -37,7 +37,12 @@ class SimpleDecoding(nn.Module):
 
         self.conv1_1 = nn.Conv2d(hidden_size, 2, 1)
 
-    def forward(self, x_c4, x_c3, x_c2, x_c1):
+    @property
+    def feat_channels(self):
+        """Number of channels in the feature map before the final 1x1 conv."""
+        return self.conv2_2.out_channels
+
+    def forward(self, x_c4, x_c3, x_c2, x_c1, return_feat=False):
         # fuse Y4 and Y3
         if x_c4.size(-2) < x_c3.size(-2) or x_c4.size(-1) < x_c3.size(-1):
             x_c4 = F.interpolate(input=x_c4, size=(x_c3.size(-2), x_c3.size(-1)), mode='bilinear', align_corners=True)
@@ -67,6 +72,9 @@ class SimpleDecoding(nn.Module):
         x = self.relu1_2(x)
         x = self.conv2_2(x)
         x = self.bn2_2(x)
-        x = self.relu2_2(x)
+        feat = self.relu2_2(x)
 
-        return self.conv1_1(x)
+        seg = self.conv1_1(feat)
+        if return_feat:
+            return seg, feat
+        return seg

@@ -252,53 +252,45 @@ def focal_loss(input, target, alpha=0.75, gamma=2.0):
 CLS_LOSS_WEIGHT = {0: 1.0, 1: 2.0, 2: 1.5, 3: 1.0, 4: 1.0}
 
 
-def criterion(input, target, category=None, neg_fp_weight=3.0):
+def criterion(seg_out, exist_out, target, is_pos, category=None,
+              exist_weight=1.0):
     """
-    Positive samples (has foreground): BCE + Dice + Focal, weighted by category
-    Negative samples (all background): BCE with heavier false-positive penalty
-    Fully vectorized — no per-sample loop.
+    Positive samples: seg (BCE + Dice + Focal) + exist BCE (gt=1)
+    Negative samples: exist BCE only (gt=0), no seg loss
     """
-    B = input.shape[0]
-    neg_class_weight = torch.tensor([1.0, neg_fp_weight], device=input.device)
+    B = seg_out.shape[0]
 
-    # mask: which samples are positive
+    # ── existence loss (all samples) ──────────────────────────────────────
+    exist_gt = is_pos.float()  # (B,) 1.0 for positive, 0.0 for negative
+    exist_loss = nn.functional.binary_cross_entropy_with_logits(exist_out, exist_gt)
+
+    # ── segmentation loss (positive samples only) ─────────────────────────
     has_fg = target.flatten(1).sum(1) > 0  # (B,) bool
 
-    # per-pixel BCE for all samples
-    bce_per_sample = nn.functional.cross_entropy(
-        input, target, reduction='none'
-    ).mean(dim=(1, 2))  # (B,)
-
-    # per-pixel BCE (with class weight) for negative samples
-    bce_neg_per_sample = nn.functional.cross_entropy(
-        input, target, weight=neg_class_weight, reduction='none'
-    ).mean(dim=(1, 2))  # (B,)
-
-    # per-sample category loss weight
-    if category is not None:
-        cls_w = torch.ones(B, device=input.device)
-        for cat, w in CLS_LOSS_WEIGHT.items():
-            cls_w[category == cat] = w
-    else:
-        cls_w = torch.ones(B, device=input.device)
-
     if has_fg.any():
-        pos_input  = input[has_fg]
+        pos_input  = seg_out[has_fg]
         pos_target = target[has_fg]
+
+        bce_per_sample = nn.functional.cross_entropy(
+            pos_input, pos_target, reduction='none'
+        ).mean(dim=(1, 2))  # (n_pos,)
+
         dice = dice_loss(pos_input, pos_target)
         fl   = focal_loss(pos_input, pos_target, alpha=0.75, gamma=2.0)
 
-        # weighted positive per-sample BCE
-        pos_bce = (bce_per_sample[has_fg] * cls_w[has_fg]).sum() / cls_w[has_fg].sum()
-        pos_loss = pos_bce + dice + fl
-
-        neg_loss = bce_neg_per_sample[~has_fg].mean() if (~has_fg).any() else 0.0
-
-        n_pos = has_fg.sum().float()
-        n_neg = (~has_fg).sum().float()
-        return (pos_loss * n_pos + neg_loss * n_neg) / (n_pos + n_neg)
+        # per-sample category loss weight
+        if category is not None:
+            pos_cat = category[has_fg]
+            cls_w = torch.ones(pos_cat.shape[0], device=seg_out.device)
+            for cat, w in CLS_LOSS_WEIGHT.items():
+                cls_w[pos_cat == cat] = w
+            seg_loss = (bce_per_sample * cls_w).sum() / cls_w.sum() + dice + fl
+        else:
+            seg_loss = bce_per_sample.mean() + dice + fl
     else:
-        return bce_neg_per_sample.mean()
+        seg_loss = 0.0
+
+    return seg_loss + exist_weight * exist_loss
 
 
 # ── IoU ───────────────────────────────────────────────────────────────────────
@@ -338,7 +330,12 @@ def evaluate(model, data_loader, bert_model):
 
     # negative sample metrics
     neg_total   = 0
-    neg_correct = 0  # true negatives: model predicts no foreground
+    neg_correct = 0   # TN via seg head (pred all bg)
+    neg_correct_exist = 0  # TN via existence head (exist_prob < 0.5)
+
+    # existence head accuracy
+    exist_correct = 0
+    exist_total   = 0
 
     # per-category positive metrics
     cat_ious = {1: [], 2: [], 3: [], 4: []}
@@ -361,15 +358,22 @@ def evaluate(model, data_loader, bert_model):
                 )[0]
                 embedding  = last_hidden_states.permute(0, 2, 1)
                 attentions = attentions.unsqueeze(dim=-1)
-                output     = model(image, embedding, l_mask=attentions)
+                seg_out, exist_out = model(image, embedding, l_mask=attentions)
             else:
-                output = model(image, sentences, l_mask=attentions)
+                seg_out, exist_out = model(image, sentences, l_mask=attentions)
 
             is_pos = meta['is_pos'].item()
             cat    = meta['category'].item()
+            exist_prob = torch.sigmoid(exist_out).item()
+
+            # existence accuracy
+            exist_total += 1
+            exist_pred = 1 if exist_prob >= 0.5 else 0
+            if exist_pred == is_pos:
+                exist_correct += 1
 
             if is_pos == 1:
-                iou, I, U = IoU(output, target)
+                iou, I, U = IoU(seg_out, target)
                 acc_ious += iou
                 mean_IoU.append(iou)
                 cum_I += I
@@ -380,11 +384,14 @@ def evaluate(model, data_loader, bert_model):
                 if cat in cat_ious:
                     cat_ious[cat].append(iou)
             else:
-                # negative: model should predict all background
-                pred = output.cpu().argmax(1)
                 neg_total += 1
+                # TN via seg head
+                pred = seg_out.cpu().argmax(1)
                 if pred.sum() == 0:
                     neg_correct += 1
+                # TN via existence head
+                if exist_prob < 0.5:
+                    neg_correct_exist += 1
 
     if seg_total > 0:
         mean_IoU = np.array(mean_IoU)
@@ -395,6 +402,8 @@ def evaluate(model, data_loader, bert_model):
         mIoU = iou = overall = 0.0
 
     tn_rate = neg_correct / neg_total if neg_total > 0 else 0.0
+    tn_rate_exist = neg_correct_exist / neg_total if neg_total > 0 else 0.0
+    exist_acc = exist_correct / exist_total if exist_total > 0 else 0.0
 
     print('Final val results:')
     print(f'  Positive samples: {seg_total}')
@@ -406,7 +415,10 @@ def evaluate(model, data_loader, bert_model):
             seg_correct[n_eval_iou] * 100. / max(seg_total, 1),
         )
     results_str += '    overall IoU = %.2f%%\n' % (overall * 100.)
-    results_str += f'  Negative samples: {neg_total}  TN rate: {tn_rate*100:.2f}%\n'
+    results_str += f'  Negative samples: {neg_total}\n'
+    results_str += f'    TN rate (seg head):   {tn_rate*100:.2f}%\n'
+    results_str += f'    TN rate (exist head): {tn_rate_exist*100:.2f}%\n'
+    results_str += f'  Existence accuracy: {exist_acc*100:.2f}% ({exist_correct}/{exist_total})\n'
     cat_names = {1: 'benign', 2: 'prob_benign', 3: 'prob_suspicious', 4: 'suspicious'}
     results_str += '  Per-category IoU:\n'
     for cat in [1, 2, 3, 4]:
@@ -448,11 +460,13 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
             )[0]
             embedding  = last_hidden_states.permute(0, 2, 1)
             attentions = attentions.unsqueeze(dim=-1)
-            output     = model(image, embedding, l_mask=attentions)
+            seg_out, exist_out = model(image, embedding, l_mask=attentions)
         else:
-            output = model(image, sentences, l_mask=attentions)
+            seg_out, exist_out = model(image, sentences, l_mask=attentions)
 
-        loss = criterion(output, target, category=meta['category'].cuda())
+        is_pos = meta['is_pos'].cuda()
+        loss = criterion(seg_out, exist_out, target,
+                         is_pos=is_pos, category=meta['category'].cuda())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -464,7 +478,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         metric_logger.update(loss=loss.item(),
                              lr=optimizer.param_groups[0]['lr'])
 
-        del image, target, sentences, attentions, meta, loss, output, data
+        del image, target, sentences, attentions, meta, loss, seg_out, exist_out, data
         if bert_model is not None:
             del last_hidden_states, embedding
 
@@ -572,36 +586,65 @@ def main(args):
             single_bert_model.load_state_dict(checkpoint['bert_model'])
 
     # ── parameters to optimise ────────────────────────────────────────────
-    backbone_no_decay, backbone_decay = [], []
-    for name, m in single_model.backbone.named_parameters():
-        if ('norm' in name or 'absolute_pos_embed' in name
-                or 'relative_position_bias_table' in name):
-            backbone_no_decay.append(m)
-        else:
-            backbone_decay.append(m)
+    is_unet = args.model.startswith('unet_')
 
-    if args.model != 'lavt_one':
+    if is_unet:
+        # UNet: all model params in one group (backbone, pwam, decoder, heads)
+        no_decay, decay = [], []
+        for name, p in single_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if 'norm' in name or 'bias' in name:
+                no_decay.append(p)
+            else:
+                decay.append(p)
         params_to_optimize = [
-            {'params': backbone_no_decay, 'weight_decay': 0.0},
-            {'params': backbone_decay},
-            {'params': [p for p in single_model.classifier.parameters()
-                        if p.requires_grad]},
-            {'params': reduce(operator.concat,
-                              [[p for p in single_bert_model.encoder.layer[i].parameters()
-                                if p.requires_grad]
-                               for i in range(10)])},
+            {'params': no_decay, 'weight_decay': 0.0},
+            {'params': decay},
         ]
+        if bert_model is not None:
+            params_to_optimize.append(
+                {'params': reduce(operator.concat,
+                                  [[p for p in single_bert_model.encoder.layer[i].parameters()
+                                    if p.requires_grad]
+                                   for i in range(10)])},
+            )
     else:
-        params_to_optimize = [
-            {'params': backbone_no_decay, 'weight_decay': 0.0},
-            {'params': backbone_decay},
-            {'params': [p for p in single_model.classifier.parameters()
-                        if p.requires_grad]},
-            {'params': reduce(operator.concat,
-                              [[p for p in single_model.text_encoder.encoder.layer[i].parameters()
-                                if p.requires_grad]
-                               for i in range(10)])},
-        ]
+        # LAVT / LAVT One: original param grouping + exist_head
+        backbone_no_decay, backbone_decay = [], []
+        for name, m in single_model.backbone.named_parameters():
+            if ('norm' in name or 'absolute_pos_embed' in name
+                    or 'relative_position_bias_table' in name):
+                backbone_no_decay.append(m)
+            else:
+                backbone_decay.append(m)
+
+        if args.model != 'lavt_one':
+            params_to_optimize = [
+                {'params': backbone_no_decay, 'weight_decay': 0.0},
+                {'params': backbone_decay},
+                {'params': [p for p in single_model.classifier.parameters()
+                            if p.requires_grad]},
+                {'params': [p for p in single_model.exist_head.parameters()
+                            if p.requires_grad]},
+                {'params': reduce(operator.concat,
+                                  [[p for p in single_bert_model.encoder.layer[i].parameters()
+                                    if p.requires_grad]
+                                   for i in range(10)])},
+            ]
+        else:
+            params_to_optimize = [
+                {'params': backbone_no_decay, 'weight_decay': 0.0},
+                {'params': backbone_decay},
+                {'params': [p for p in single_model.classifier.parameters()
+                            if p.requires_grad]},
+                {'params': [p for p in single_model.exist_head.parameters()
+                            if p.requires_grad]},
+                {'params': reduce(operator.concat,
+                                  [[p for p in single_model.text_encoder.encoder.layer[i].parameters()
+                                    if p.requires_grad]
+                                   for i in range(10)])},
+            ]
 
     # ── optimizer & scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
