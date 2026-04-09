@@ -35,7 +35,6 @@ Example – multi-GPU (torchrun):
 
 import argparse
 import datetime
-import gc
 import os
 import time
 from functools import reduce
@@ -352,15 +351,17 @@ def evaluate(model, data_loader, bert_model):
             sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
 
+            category = meta['category'].cuda()
+
             if bert_model is not None:
                 last_hidden_states = bert_model(
                     sentences, attention_mask=attentions
                 )[0]
                 embedding  = last_hidden_states.permute(0, 2, 1)
                 attentions = attentions.unsqueeze(dim=-1)
-                seg_out, exist_out = model(image, embedding, l_mask=attentions)
+                seg_out, exist_out = model(image, embedding, l_mask=attentions, category=category)
             else:
-                seg_out, exist_out = model(image, sentences, l_mask=attentions)
+                seg_out, exist_out = model(image, sentences, l_mask=attentions, category=category)
 
             is_pos = meta['is_pos'].item()
             cat    = meta['category'].item()
@@ -373,7 +374,11 @@ def evaluate(model, data_loader, bert_model):
                 exist_correct += 1
 
             if is_pos == 1:
-                iou, I, U = IoU(seg_out, target)
+                # gate segmentation by existence head
+                if exist_prob < 0.5:
+                    iou, I, U = 0.0, 0, 0
+                else:
+                    iou, I, U = IoU(seg_out, target)
                 acc_ious += iou
                 mean_IoU.append(iou)
                 cum_I += I
@@ -454,37 +459,30 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         sentences  = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
 
+        category = meta['category'].cuda()
+
         if bert_model is not None:
             last_hidden_states = bert_model(
                 sentences, attention_mask=attentions
             )[0]
             embedding  = last_hidden_states.permute(0, 2, 1)
             attentions = attentions.unsqueeze(dim=-1)
-            seg_out, exist_out = model(image, embedding, l_mask=attentions)
+            seg_out, exist_out = model(image, embedding, l_mask=attentions, category=category)
         else:
-            seg_out, exist_out = model(image, sentences, l_mask=attentions)
+            seg_out, exist_out = model(image, sentences, l_mask=attentions, category=category)
 
         is_pos = meta['is_pos'].cuda()
         loss = criterion(seg_out, exist_out, target,
-                         is_pos=is_pos, category=meta['category'].cuda())
+                         is_pos=is_pos, category=category)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
 
-        torch.cuda.synchronize()
         train_loss += loss.item()
         iterations += 1
         metric_logger.update(loss=loss.item(),
                              lr=optimizer.param_groups[0]['lr'])
-
-        del image, target, sentences, attentions, meta, loss, seg_out, exist_out, data
-        if bert_model is not None:
-            del last_hidden_states, embedding
-
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -627,6 +625,8 @@ def main(args):
                             if p.requires_grad]},
                 {'params': [p for p in single_model.exist_head.parameters()
                             if p.requires_grad]},
+                {'params': [single_model.class_embed.weight,
+                            single_model.class_pos_embed]},
                 {'params': reduce(operator.concat,
                                   [[p for p in single_bert_model.encoder.layer[i].parameters()
                                     if p.requires_grad]
@@ -640,6 +640,8 @@ def main(args):
                             if p.requires_grad]},
                 {'params': [p for p in single_model.exist_head.parameters()
                             if p.requires_grad]},
+                {'params': [single_model.class_embed.weight,
+                            single_model.class_pos_embed]},
                 {'params': reduce(operator.concat,
                                   [[p for p in single_model.text_encoder.encoder.layer[i].parameters()
                                     if p.requires_grad]
@@ -672,6 +674,22 @@ def main(args):
 
     # ── training loop ─────────────────────────────────────────────────────
     for epoch in range(max(0, resume_epoch + 1), args.epochs):
+        # resample negatives each epoch (different subset, same ratio)
+        if hasattr(dataset, 'resample_negatives'):
+            dataset.resample_negatives(epoch=epoch)
+            # rebuild batch sampler with new annotations
+            if not distributed:
+                train_sampler = PatientAwareBatchSampler(
+                    dataset.annotations, batch_size=args.batch_size,
+                    drop_last=True, seed=42,
+                )
+                data_loader = torch.utils.data.DataLoader(
+                    dataset,
+                    batch_sampler=train_sampler,
+                    num_workers=args.workers,
+                    pin_memory=args.pin_mem,
+                )
+
         if distributed:
             data_loader.sampler.set_epoch(epoch)
         else:

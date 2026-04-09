@@ -52,61 +52,57 @@ class LNDataset(data.Dataset):
         with open(ann_path, 'r') as f:
             all_annotations = json.load(f)
 
-        # ── downsample negatives (train only) ─────────────────────────────
-        # neg_ratio: max negatives = neg_ratio × num_positives
-        # default 2.0 → at most 2 negatives per 1 positive
-        # val/test: keep all for complete evaluation
-        neg_ratio = getattr(args, 'neg_ratio', 2.0)
-        if split == 'train' and neg_ratio > 0:
-            pos = [a for a in all_annotations if a['is_pos'] == 1]
-            neg = [a for a in all_annotations if a['is_pos'] == 0]
-            max_neg = int(len(pos) * neg_ratio)
-            if len(neg) > max_neg:
-                random.seed(42)
-                neg = random.sample(neg, max_neg)
-            self.annotations = pos + neg
-            random.shuffle(self.annotations)
-            print(f'  [{split}] pos={len(pos)}, neg={len(neg)} '
-                  f'(downsampled from {len(all_annotations) - len(pos)}, '
-                  f'ratio=1:{neg_ratio})')
+        # ── negative sampling config ──────────────────────────────────────
+        self.neg_ratio = getattr(args, 'neg_ratio', 2.0)
+        self._pos = [a for a in all_annotations if a['is_pos'] == 1]
+        self._neg = [a for a in all_annotations if a['is_pos'] == 0]
+
+        if split == 'train' and self.neg_ratio > 0:
+            self.resample_negatives(epoch=0)
         else:
             self.annotations = all_annotations
 
         self.image_dir = os.path.join(args.ln_dataset_root, 'images', split)
         self.mask_dir  = os.path.join(args.ln_dataset_root, 'masks',  split)
 
-        # ── tokenise all sentences up-front ──────────────────────────────
-        self.tokenizer       = BertTokenizer.from_pretrained(args.bert_tokenizer)
-        self.input_ids       = []
-        self.attention_masks = []
-
-        for ann in self.annotations:
-            sentences_for_ref  = []
-            attentions_for_ref = []
-
-            for sentence_raw in ann['sentences']:
-                padded_input_ids = [0] * self.max_tokens
-                attention_mask   = [0] * self.max_tokens
-
-                input_ids = self.tokenizer.encode(
-                    text=sentence_raw, add_special_tokens=True
-                )
-                input_ids = input_ids[:self.max_tokens]
-
-                padded_input_ids[:len(input_ids)] = input_ids
-                attention_mask[:len(input_ids)]   = [1] * len(input_ids)
-
-                sentences_for_ref.append(
-                    torch.tensor(padded_input_ids).unsqueeze(0)
-                )
-                attentions_for_ref.append(
-                    torch.tensor(attention_mask).unsqueeze(0)
-                )
-
-            self.input_ids.append(sentences_for_ref)
-            self.attention_masks.append(attentions_for_ref)
+        # ── tokeniser (cache by unique sentence) ─────────────────────────
+        self.tokenizer = BertTokenizer.from_pretrained(args.bert_tokenizer)
+        self._token_cache = {}  # sentence_str → (input_ids_tensor, attn_mask_tensor)
+        self._build_token_cache(all_annotations)
 
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def _build_token_cache(self, all_annotations):
+        """Tokenise each unique sentence once and cache the result."""
+        for ann in all_annotations:
+            for s in ann['sentences']:
+                if s in self._token_cache:
+                    continue
+                padded = [0] * self.max_tokens
+                attn   = [0] * self.max_tokens
+                ids = self.tokenizer.encode(text=s, add_special_tokens=True)
+                ids = ids[:self.max_tokens]
+                padded[:len(ids)] = ids
+                attn[:len(ids)]   = [1] * len(ids)
+                self._token_cache[s] = (
+                    torch.tensor(padded).unsqueeze(0),
+                    torch.tensor(attn).unsqueeze(0),
+                )
+        print(f'  Token cache: {len(self._token_cache)} unique sentences')
+
+    def resample_negatives(self, epoch=0):
+        """Re-sample negative subset each epoch so all negatives are seen over time."""
+        max_neg = int(len(self._pos) * self.neg_ratio)
+        if len(self._neg) > max_neg:
+            rng = random.Random(42 + epoch)
+            sampled_neg = rng.sample(self._neg, max_neg)
+        else:
+            sampled_neg = self._neg
+        self.annotations = self._pos + sampled_neg
+        random.Random(42 + epoch).shuffle(self.annotations)
+        print(f'  [train] resample epoch {epoch}: pos={len(self._pos)}, '
+              f'neg={len(sampled_neg)}/{len(self._neg)}, '
+              f'total={len(self.annotations)}')
 
     def get_classes(self):
         return []
@@ -137,13 +133,13 @@ class LNDataset(data.Dataset):
         if self.image_transforms is not None:
             img, mask = self.image_transforms(img, mask)
 
-        # ── sentence embedding ────────────────────────────────────────────
+        # ── sentence embedding (from cache) ──────────────────────────────
+        sentences = ann['sentences']
         if self.split == 'train':
-            choice_sent = np.random.choice(len(self.input_ids[index]))
+            choice_sent = np.random.choice(len(sentences))
         else:
             choice_sent = 0
-        tensor_embeddings = self.input_ids[index][choice_sent]
-        attention_mask    = self.attention_masks[index][choice_sent]
+        tensor_embeddings, attention_mask = self._token_cache[sentences[choice_sent]]
 
         meta = {
             'is_pos':   ann['is_pos'],

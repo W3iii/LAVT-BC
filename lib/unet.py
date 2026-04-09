@@ -181,16 +181,36 @@ class TextConditionedUNet(nn.Module):
             nn.Flatten(),
             nn.Linear(chs[0], 1),
         )
+        # learnable class embedding (concat as extra token)
+        self.class_embed = nn.Embedding(5, 768)
+        self.class_pos_embed = nn.Parameter(torch.zeros(1, 768, 1))
+        nn.init.normal_(self.class_embed.weight, std=0.02)
+        nn.init.normal_(self.class_pos_embed, std=0.02)
         # expose for compatibility
         self.classifier.feat_channels = chs[0]
 
-    def forward(self, x, l_feats, l_mask):
+    def _inject_class_token(self, l_feats, l_mask, category):
+        """Concat learnable class token to language sequence."""
+        B = l_feats.shape[0]
+        cls_emb = self.class_embed(category).unsqueeze(-1)        # (B, 768, 1)
+        cls_emb = cls_emb + self.class_pos_embed
+        l_feats = torch.cat([l_feats, cls_emb], dim=-1)           # (B, 768, seq_len+1)
+        cls_mask = torch.ones(B, 1, 1, device=l_mask.device)
+        l_mask = torch.cat([l_mask, cls_mask], dim=1)             # (B, seq_len+1, 1)
+        return l_feats, l_mask
+
+    def forward(self, x, l_feats, l_mask, category=None):
         """
         x:       (B, 3, H, W) image
         l_feats: (B, 768, N_l) language features
         l_mask:  (B, N_l, 1)   language attention mask
+        category: (B,) int tensor, class index 0-4
         """
         input_shape = x.shape[-2:]
+
+        # inject learnable class token
+        if category is not None:
+            l_feats, l_mask = self._inject_class_token(l_feats, l_mask, category)
 
         # encoder
         features = self.backbone(x)  # [e1, e2, e3, e4]
