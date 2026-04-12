@@ -220,74 +220,84 @@ def get_transform(args):
     ]
     return T.Compose(tfms)
 
-
-# ── loss ──────────────────────────────────────────────────────────────────────
-
-def dice_loss(input, target, smooth=1.0):
-    prob = torch.softmax(input, dim=1)[:, 1]
-    gt   = target.float()
-    intersection = (prob * gt).sum(dim=(1, 2))
-    dice = (2.0 * intersection + smooth) / (prob.sum(dim=(1, 2)) + gt.sum(dim=(1, 2)) + smooth)
-    return 1.0 - dice.mean()
-
-
-def focal_loss(input, target, alpha=0.75, gamma=2.0):
-    """
-    Focal Loss for binary segmentation (2-class softmax output).
-    alpha = weight for foreground (class 1), (1-alpha) for background (class 0).
-    For rare foreground like lung nodules, alpha > 0.5 upweights foreground.
-    """
-    ce = nn.functional.cross_entropy(input, target, reduction='none')  # (B, H, W)
-    prob = torch.softmax(input, dim=1)                                 # (B, 2, H, W)
-    # p_t = probability of the ground-truth class
-    p_t = prob.gather(1, target.unsqueeze(1)).squeeze(1)               # (B, H, W)
-    # class-specific alpha: foreground=alpha, background=1-alpha
-    alpha_t = torch.where(target == 1, alpha, 1.0 - alpha)
-    focal_weight = alpha_t * (1.0 - p_t) ** gamma
-    return (focal_weight * ce).mean()
-
-
-# per-category loss weight: upweight rare/small categories
+# ── per-category loss weight ───────────────────────────────────────────────────
 CLS_LOSS_WEIGHT = {0: 1.0, 1: 2.0, 2: 1.5, 3: 1.0, 4: 1.0}
 
+_WEIGHT_TABLE = torch.tensor(
+    [CLS_LOSS_WEIGHT.get(i, 1.0) for i in range(5)],
+    dtype=torch.float32
+)  # tensor([1.0, 2.0, 1.5, 1.0, 1.0])
 
-def criterion(seg_out, exist_out, target, is_pos, category=None,
-              exist_weight=1.0):
+# ── per-sample losses ──────────────────────────────────────────────────────────
+
+def dice_loss_per_sample(input, target, smooth=1.0):
     """
-    Positive samples: seg (BCE + Dice + Focal) + exist BCE (gt=1)
-    Negative samples: exist BCE only (gt=0), no seg loss
+    input:  (B, 2, H, W) logits
+    target: (B, H, W)    long
+    return: (B,)         per-sample dice loss
     """
+    prob         = torch.softmax(input, dim=1)[:, 1]          # (B, H, W)
+    gt           = target.float()
+    intersection = (prob * gt).sum(dim=(1, 2))                 # (B,)
+    union        = prob.sum(dim=(1, 2)) + gt.sum(dim=(1, 2))   # (B,)
+    dice         = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice                                          # (B,)
+
+def focal_loss_per_sample(input, target, alpha=0.75, gamma=2.0):
+    """
+    input:  (B, 2, H, W) logits
+    target: (B, H, W)    long
+    return: (B,)         per-sample focal loss
+    """
+    ce      = F.cross_entropy(input, target, reduction='none')  # (B, H, W)
+    prob    = torch.softmax(input, dim=1)
+    p_t     = prob.gather(1, target.unsqueeze(1)).squeeze(1)    # (B, H, W)
+    alpha_t = torch.where(
+        target == 1,
+        torch.tensor(alpha,       device=input.device),
+        torch.tensor(1.0 - alpha, device=input.device)
+    )
+    focal_w = alpha_t * (1.0 - p_t) ** gamma
+    return (focal_w * ce).mean(dim=(1, 2))                      # (B,)
+
+# ── main criterion ─────────────────────────────────────────────────────────────
+
+def criterion(seg_out, exist_out, target, is_pos,
+              category=None, exist_weight=0.5):
     B = seg_out.shape[0]
 
-    # ── existence loss (all samples) ──────────────────────────────────────
-    exist_gt = is_pos.float()  # (B,) 1.0 for positive, 0.0 for negative
-    exist_loss = nn.functional.binary_cross_entropy_with_logits(exist_out, exist_gt)
+    # ── existence loss（全 batch，向量化）─────────────────────────────────
+    exist_gt   = is_pos.float().view(B, 1)
+    exist_loss = nn.functional.binary_cross_entropy_with_logits(
+        exist_out, exist_gt,
+        pos_weight=torch.tensor([3.0], device=seg_out.device)
+    )
 
-    # ── segmentation loss (positive samples only) ─────────────────────────
-    has_fg = target.flatten(1).sum(1) > 0  # (B,) bool
+    # ── segmentation loss（只有正樣本）────────────────────────────────────
+    has_fg = target.flatten(1).sum(1) > 0   # (B,)
 
-    if has_fg.any():
-        pos_input  = seg_out[has_fg]
-        pos_target = target[has_fg]
+    if not has_fg.any():
+        return exist_weight * exist_loss
 
-        bce_per_sample = nn.functional.cross_entropy(
-            pos_input, pos_target, reduction='none'
-        ).mean(dim=(1, 2))  # (n_pos,)
+    pos_input  = seg_out[has_fg]    # (n_pos, 2, H, W)
+    pos_target = target[has_fg]     # (n_pos, H, W)
 
-        dice = dice_loss(pos_input, pos_target)
-        fl   = focal_loss(pos_input, pos_target, alpha=0.75, gamma=2.0)
+    # per-sample loss
+    bce_per   = nn.functional.cross_entropy(
+        pos_input, pos_target, reduction='none'
+    ).mean(dim=(1, 2))                                    # (n_pos,)
+    dice_per  = dice_loss_per_sample(pos_input, pos_target)   # (n_pos,)
+    focal_per = focal_loss_per_sample(pos_input, pos_target)  # (n_pos,)
 
-        # per-sample category loss weight
-        if category is not None:
-            pos_cat = category[has_fg]
-            cls_w = torch.ones(pos_cat.shape[0], device=seg_out.device)
-            for cat, w in CLS_LOSS_WEIGHT.items():
-                cls_w[pos_cat == cat] = w
-            seg_loss = (bce_per_sample * cls_w).sum() / cls_w.sum() + dice + fl
-        else:
-            seg_loss = bce_per_sample.mean() + dice + fl
+    loss_per = bce_per + dice_per + focal_per             # (n_pos,)
+
+    # cls weight（向量化，無 for loop）
+    if category is not None:
+        pos_cat = category[has_fg]                        # (n_pos,)
+        cls_w   = _WEIGHT_TABLE.to(seg_out.device)[pos_cat]  # (n_pos,)
+        seg_loss = (loss_per * cls_w).sum() / cls_w.sum()
     else:
-        seg_loss = 0.0
+        seg_loss = loss_per.mean()
 
     return seg_loss + exist_weight * exist_loss
 
