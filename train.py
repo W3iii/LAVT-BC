@@ -523,9 +523,6 @@ def main(args):
         pretrained=args.pretrained_swin_weights, args=args)
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
-    
-    print('backbone.num_features:', single_model.backbone.num_features)
-    print('exist_head:', single_model.exist_head)
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -569,6 +566,9 @@ def main(args):
 
     # exist_head params — directly available, no lazy-build
     exist_params = list(single_model.exist_head.parameters())
+    
+    print('backbone.num_features:', single_model.backbone.num_features)
+    print('exist_head:', single_model.exist_head)
 
     if args.model != 'lavt_one':
         params_to_optimize = [
