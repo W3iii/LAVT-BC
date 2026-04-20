@@ -179,7 +179,7 @@ def criterion(seg_out, exist_out, target, is_pos,
     exist_gt   = is_pos.float()
     exist_loss = F.binary_cross_entropy_with_logits(
         exist_out, exist_gt,
-        pos_weight=torch.tensor(6.0, device=seg_out.device))
+        pos_weight=torch.tensor(3.0, device=seg_out.device))
 
     has_fg = is_pos.bool()
 
@@ -447,18 +447,6 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
 
         optimizer.zero_grad()
         loss.backward()
-        
-        if total_its == 1:
-            _m = model.module if hasattr(model, 'module') else model
-            for name, p in _m.exist_head.named_parameters():
-                grad = p.grad
-                if grad is None:
-                    print(f'  exist_head.{name}: grad=None !!!')
-                else:
-                    print(f'  exist_head.{name}: grad_norm={grad.norm().item():.6f}')
-                optimizer.step()
-                lr_scheduler.step()
-
         train_loss += loss.item()
         iterations += 1
         metric_logger.update(loss=loss.item(),
@@ -566,9 +554,6 @@ def main(args):
 
     # exist_head params — directly available, no lazy-build
     exist_params = list(single_model.exist_head.parameters())
-    
-    print('backbone.num_features:', single_model.backbone.num_features)
-    print('exist_head:', single_model.exist_head)
 
     if args.model != 'lavt_one':
         params_to_optimize = [
