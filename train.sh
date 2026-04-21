@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --pin_mem \
     --output-dir ./checkpoints/ln_existBCE_v2_weighted_crop \
     --neg_ratio 1 \
-    --fg_prob 0.67 \2
+    --fg_prob 0.67 \
     --iters_per_epoch 1000 \
     --val_every 5 \
     --early_stop 15 \
