@@ -59,6 +59,8 @@ def get_parser():
     parser.add_argument('--print-freq', default=10, type=int)
     parser.add_argument('-j', '--workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true')
+    parser.add_argument('--val_every', default=1, type=int,
+                        help='Run validation every N epochs (default 1)')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--local_rank', type=int, default=-1)
 
@@ -164,7 +166,7 @@ def criterion(seg_out, exist_out, target, is_pos,
     exist_gt   = is_pos.float()
     exist_loss = F.binary_cross_entropy_with_logits(
         exist_out, exist_gt,
-        pos_weight=torch.tensor(6.0, device=seg_out.device))
+        pos_weight=torch.tensor(3.0, device=seg_out.device))
 
     has_fg = is_pos.bool()
 
@@ -533,6 +535,11 @@ def main(args):
         train_one_epoch(
             model, criterion, optimizer, data_loader,
             lr_scheduler, epoch, args.print_freq, iterations, bert_model)
+
+        # Validate every val_every epochs (and always on the last epoch)
+        if (epoch + 1) % args.val_every != 0 and epoch != args.epochs - 1:
+            print(f'Epoch {epoch}  |  skip validation (every {args.val_every} epochs)')
+            continue
 
         iou, overallIoU = evaluate(model, data_loader_val, bert_model)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
