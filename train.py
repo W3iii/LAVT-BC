@@ -128,14 +128,7 @@ def get_dataset(split, transform, args):
 
 
 def get_transform(args):
-    patch_size = getattr(args, 'patch_size', 0)
-    fg_prob = getattr(args, 'fg_prob', 0.67)
-
-    tfms = []
-    if patch_size > 0:
-        # Foreground oversampling: crop patch first, then resize to model input
-        tfms.append(T.ForegroundCrop(patch_size, fg_prob=fg_prob))
-    tfms += [
+    tfms = [
         T.Resize(args.img_size, args.img_size),
         T.RandomHorizontalFlip(flip_prob=0.5),
         T.RandomAffine(angle=(-15, 15), translate=(0.10, 0.10),
@@ -281,7 +274,7 @@ def sliding_window_inference(model, image_full, sentences, attentions,
     return seg_out, exist_prob
 
 
-def evaluate(model, data_loader, bert_model, patch_size=0, img_size=384):
+def evaluate(model, data_loader, bert_model):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Val:'
@@ -315,27 +308,17 @@ def evaluate(model, data_loader, bert_model, patch_size=0, img_size=384):
             is_pos     = meta['is_pos'].item()
             cat        = meta['category'].item()
 
-            if patch_size > 0:
-                # Sliding window inference
-                seg_out, exist_prob = sliding_window_inference(
-                    model, image, sentences, attentions, category,
-                    bert_model, patch_size, img_size)
-                # Resize seg_out to match target size
-                seg_out = F.interpolate(seg_out, size=target.shape[-2:],
-                                        mode='bilinear', align_corners=False)
+            if bert_model is not None:
+                last_hidden_states = bert_model(
+                    sentences, attention_mask=attentions)[0]
+                embedding  = last_hidden_states.permute(0, 2, 1)
+                attentions = attentions.unsqueeze(dim=-1)
+                seg_out, exist_out = model(
+                    image, embedding, l_mask=attentions, category=category)
             else:
-                # Standard full-image inference
-                if bert_model is not None:
-                    last_hidden_states = bert_model(
-                        sentences, attention_mask=attentions)[0]
-                    embedding  = last_hidden_states.permute(0, 2, 1)
-                    attentions = attentions.unsqueeze(dim=-1)
-                    seg_out, exist_out = model(
-                        image, embedding, l_mask=attentions, category=category)
-                else:
-                    seg_out, exist_out = model(
-                        image, sentences, l_mask=attentions, category=category)
-                exist_prob = torch.sigmoid(exist_out).item()
+                seg_out, exist_out = model(
+                    image, sentences, l_mask=attentions, category=category)
+            exist_prob = torch.sigmoid(exist_out).item()
 
             exist_total += 1
             exist_pred = 1 if exist_prob >= 0.5 else 0
@@ -462,18 +445,11 @@ def main(args):
         os.makedirs(os.path.join('./models', args.model_id), exist_ok=True)
 
     train_transform = get_transform(args)
-    if args.patch_size > 0:
-        # Sliding window: val images at original resolution (no Resize)
-        val_transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-    else:
-        val_transform = T.Compose([
-            T.Resize(args.img_size, args.img_size),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+    val_transform = T.Compose([
+        T.Resize(args.img_size, args.img_size),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
     dataset,     num_classes = get_dataset('train', train_transform, args)
     dataset_val, _           = get_dataset('val',   val_transform,   args)
 
@@ -626,9 +602,7 @@ def main(args):
             print(f'Epoch {epoch}  |  skip validation (every {args.val_every} epochs)')
             continue
 
-        iou, overallIoU = evaluate(
-            model, data_loader_val, bert_model,
-            patch_size=args.patch_size, img_size=args.img_size)
+        iou, overallIoU = evaluate(model, data_loader_val, bert_model)
         print(f'Epoch {epoch}  |  Mean IoU: {iou:.2f}  |  Overall IoU: {overallIoU:.2f}')
 
         save_ckpt = best_oIoU < overallIoU
