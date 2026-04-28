@@ -91,18 +91,71 @@ class LNDataset(data.Dataset):
         print(f'  Token cache: {len(self._token_cache)} unique sentences')
 
     def resample_negatives(self, epoch=0):
-        """Re-sample negative subset each epoch so all negatives are seen over time."""
-        max_neg = int(len(self._pos) * self.neg_ratio)
-        if len(self._neg) > max_neg:
-            rng = random.Random(42 + epoch)
-            sampled_neg = rng.sample(self._neg, max_neg)
+        """Image-grouped negative resampling.
+
+        For every positive image, keep its 'paired' negatives — i.e. negatives
+        that come from the SAME image (these are the "wrong prompt" entries
+        that drive the contrastive signal).  Then add a controlled number of
+        pure-normal-slice negatives (images that have NO positive entry at all).
+
+        This preserves the (correct prompt vs wrong prompt) pairing on the same
+        image, which is what teaches the model to differentiate prompts.
+        """
+        from collections import defaultdict
+
+        rng = random.Random(42 + epoch)
+
+        # group negatives by image
+        neg_by_img = defaultdict(list)
+        for ann in self._neg:
+            neg_by_img[ann['image']].append(ann)
+
+        # group positives by image
+        pos_by_img = defaultdict(list)
+        for ann in self._pos:
+            pos_by_img[ann['image']].append(ann)
+
+        sampled = []
+        n_paired_neg = 0
+
+        # Stage 1: for every positive image, keep all (or up to ratio*pos)
+        # of its same-image negatives.  These are the "wrong prompt" pairs.
+        for img, pos_anns in pos_by_img.items():
+            sampled.extend(pos_anns)
+            same_img_negs = neg_by_img.get(img, [])
+            if not same_img_negs:
+                continue
+            # cap at neg_ratio * (pos count for this image), but at least keep
+            # 1 if any exist, since the contrastive signal is image-local
+            cap = max(1, int(round(len(pos_anns) * self.neg_ratio)))
+            if len(same_img_negs) > cap:
+                picked = rng.sample(same_img_negs, cap)
+            else:
+                picked = same_img_negs
+            sampled.extend(picked)
+            n_paired_neg += len(picked)
+
+        # Stage 2: pure-normal-slice images (no positive entry at all).
+        # These teach the model "even with cat 1~4 prompt, normal slice → no".
+        # Control overall budget: ~30% of positive count by default.
+        pure_normal_imgs = set(neg_by_img.keys()) - set(pos_by_img.keys())
+        pure_normal_negs = [a for img in pure_normal_imgs
+                              for a in neg_by_img[img]]
+
+        pure_budget = int(len(self._pos) * 0.3)
+        if len(pure_normal_negs) > pure_budget:
+            pure_picked = rng.sample(pure_normal_negs, pure_budget)
         else:
-            sampled_neg = self._neg
-        self.annotations = self._pos + sampled_neg
-        random.Random(42 + epoch).shuffle(self.annotations)
-        print(f'  [train] resample epoch {epoch}: pos={len(self._pos)}, '
-              f'neg={len(sampled_neg)}/{len(self._neg)}, '
-              f'total={len(self.annotations)}')
+            pure_picked = pure_normal_negs
+        sampled.extend(pure_picked)
+
+        rng.shuffle(sampled)
+        self.annotations = sampled
+        print(f'  [train] resample epoch {epoch}: '
+              f'pos={len(self._pos)}, '
+              f'paired-neg={n_paired_neg}, '
+              f'pure-normal-neg={len(pure_picked)}/{len(pure_normal_negs)}, '
+              f'total={len(sampled)}')
 
     def get_classes(self):
         return []
