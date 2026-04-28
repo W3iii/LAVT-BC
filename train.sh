@@ -1,9 +1,9 @@
-mkdir -p ./models/lavt_ln_existBCE
+mkdir -p ./models/lavt_ln_existBCE_v3
 mkdir -p ./checkpoints/
 
 CUDA_VISIBLE_DEVICES=0 python train.py \
     --model lavt \
-    --model_id lavt_ln_existBCE \
+    --model_id lavt_ln_existBCE_v3 \
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 \
     --ck_bert dmis-lab/biobert-base-cased-v1.2 \
     --ln_dataset_root ../../groups/BME/LN_dataset_2D_vlm \
@@ -17,8 +17,8 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --img_size 512 \
     --workers 4 \
     --pin_mem \
-    --output-dir ./checkpoints/ln_existBCE_v2_weighted \
+    --output-dir ./checkpoints/ln_existBCE_v3_weighted \
     --neg_ratio 1 \
     --val_every 10 \
     --early_stop 15 \
-    2>&1 | tee ./models/lavt_ln_existBCE/output 2>&1
+    2>&1 | tee ./models/lavt_ln_existBCE_v3/output 2>&1

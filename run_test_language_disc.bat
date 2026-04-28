@@ -1,6 +1,5 @@
-python test.py ^
+python test_language_disc.py ^
     --model lavt ^
-    --model_id lavt_ln_existBCE ^
     --ln_dataset_root ../dataset ^
     --split test ^
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 ^
@@ -9,5 +8,6 @@ python test.py ^
     --swin_type base ^
     --window12 ^
     --img_size 512 ^
-    --save_pred ^
-    --output_dir ./pred_results
+    --max_samples 0 ^
+    --save_vis ^
+    --output_dir ./language_disc_results

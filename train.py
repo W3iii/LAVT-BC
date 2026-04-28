@@ -365,11 +365,11 @@ def train_one_epoch(model, criterion, optimizer, data_loader,
         is_pos = meta['is_pos'].cuda()
         loss = criterion(
             seg_out, exist_out, target,
-            is_pos=is_pos, category=category, exist_weight=1.0)
+            is_pos=is_pos, category=category, exist_weight=2.0)
 
-        if epoch >= 5:
-            single = model.module if hasattr(model, 'module') else model
-            loss = loss + 0.1 * class_embed_contrastive_loss(single)
+        # class_embed contrastive: enable from epoch 0, weight up
+        single = model.module if hasattr(model, 'module') else model
+        loss = loss + 1.0 * class_embed_contrastive_loss(single)
 
         optimizer.zero_grad()
         loss.backward()
@@ -468,8 +468,8 @@ def main(args):
     for p in single_model.class_gate.parameters():
         class_params.append(p)
 
-    # exist_head params — directly available, no lazy-build
-    exist_params = list(single_model.exist_head.parameters())
+    # exist_module params (ModuleDict containing all attention-pooling layers)
+    exist_params = list(single_model.exist_module.parameters())
 
     if args.model != 'lavt_one':
         params_to_optimize = [
