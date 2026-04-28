@@ -6,3 +6,4 @@ pretrained_weights/
 *.pyc
 __pycache__/
 pred_results/
+checkpoints/    
