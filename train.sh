@@ -7,7 +7,7 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --bert_tokenizer dmis-lab/biobert-base-cased-v1.2 \
     --ck_bert dmis-lab/biobert-base-cased-v1.2 \
     --ln_dataset_root ../../groups/BME/LN_dataset_2D_vlm \
-    --batch-size 16 \
+    --batch-size 32 \
     --lr 0.00005 \
     --wd 1e-2 \
     --swin_type base \
