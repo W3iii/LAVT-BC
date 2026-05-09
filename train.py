@@ -1,316 +1,247 @@
 import datetime
 import os
 import time
+from functools import reduce
+import operator
 
 import torch
 import torch.utils.data
-from torch import nn
 
-from functools import reduce
-import operator
-from bert.modeling_bert import BertModel
-
-import torchvision
 from lib import segmentation
+from lib.loss import FocalDiceLoss
+from data.dataset_lung_nodule import LungNoduleDataset
+from data.sampler import PatientAwareBatchSampler
 
 import transforms as T
 import utils
-import numpy as np
-
-import torch.nn.functional as F
-
-import gc
-from collections import OrderedDict
-
-
-def get_dataset(image_set, transform, args):
-    from data.dataset_refer_bert import ReferDataset
-    ds = ReferDataset(args,
-                      split=image_set,
-                      image_transforms=transform,
-                      target_transforms=None
-                      )
-    num_classes = 2
-
-    return ds, num_classes
-
-
-# IoU calculation for validation
-def IoU(pred, gt):
-    pred = pred.argmax(1)
-
-    intersection = torch.sum(torch.mul(pred, gt))
-    union = torch.sum(torch.add(pred, gt)) - intersection
-
-    if intersection == 0 or union == 0:
-        iou = 0
-    else:
-        iou = float(intersection) / float(union)
-
-    return iou, intersection, union
 
 
 def get_transform(args):
-    transforms = [T.Resize(args.img_size, args.img_size),
-                  T.ToTensor(),
-                  T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                  ]
-
-    return T.Compose(transforms)
-
-
-def criterion(input, target):
-    weight = torch.FloatTensor([0.9, 1.1]).cuda()
-    return nn.functional.cross_entropy(input, target, weight=weight)
+    return T.Compose([
+        T.Resize(args.img_size, args.img_size),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
 
-def evaluate(model, data_loader, bert_model):
+def get_dataset(split, transform, args):
+    return LungNoduleDataset(
+        data_root=args.data_root,
+        split=split,
+        transforms=transform,
+        neg_ratio=args.neg_ratio,
+        seed=args.seed,
+    )
+
+
+@torch.no_grad()
+def evaluate(model, data_loader):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
-    total_its = 0
-    acc_ious = 0
 
-    # evaluation variables
-    cum_I, cum_U = 0, 0
-    eval_seg_iou_list = [.5, .6, .7, .8, .9]
-    seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
-    seg_total = 0
-    mean_IoU = []
+    iou_chunks = []
+    cum_inter = torch.zeros((), dtype=torch.float64, device='cuda')
+    cum_union = torch.zeros((), dtype=torch.float64, device='cuda')
+    n_pos = 0
+    n_neg = 0
+    n_tn = 0
 
-    with torch.no_grad():
-        for data in metric_logger.log_every(data_loader, 100, header):
-            total_its += 1
-            image, target, sentences, attentions = data
-            image, target, sentences, attentions = image.cuda(non_blocking=True),\
-                                                   target.cuda(non_blocking=True),\
-                                                   sentences.cuda(non_blocking=True),\
-                                                   attentions.cuda(non_blocking=True)
+    for image, target in metric_logger.log_every(data_loader, 100, header):
+        image = image.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)        # (B, H, W) {0, 1}
 
-            sentences = sentences.squeeze(1)
-            attentions = attentions.squeeze(1)
+        logits = model(image)                          # (B, 2, H, W)
+        pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
 
-            if bert_model is not None:
-                last_hidden_states = bert_model(sentences, attention_mask=attentions)[0]
-                embedding = last_hidden_states.permute(0, 2, 1)  # (B, 768, N_l) to make Conv1d happy
-                attentions = attentions.unsqueeze(dim=-1)  # (B, N_l, 1)
-                output = model(image, embedding, l_mask=attentions)
-            else:
-                output = model(image, sentences, l_mask=attentions)
+        target_flat = target.flatten(1)
+        pred_flat = pred.flatten(1)
+        is_pos = target_flat.any(dim=1)                # (B,) bool
 
-            iou, I, U = IoU(output, target)
-            acc_ious += iou
-            mean_IoU.append(iou)
-            cum_I += I
-            cum_U += U
-            for n_eval_iou in range(len(eval_seg_iou_list)):
-                eval_seg_iou = eval_seg_iou_list[n_eval_iou]
-                seg_correct[n_eval_iou] += (iou >= eval_seg_iou)
-            seg_total += 1
-        iou = acc_ious / total_its
+        inter = (pred_flat * target_flat).sum(dim=1).double()
+        union = (pred_flat.sum(dim=1) + target_flat.sum(dim=1)).double() - inter
+        iou = torch.where(union > 0, inter / union, torch.zeros_like(inter))
 
-    mean_IoU = np.array(mean_IoU)
-    mIoU = np.mean(mean_IoU)
-    print('Final results:')
-    print('Mean IoU is %.2f\n' % (mIoU * 100.))
-    results_str = ''
-    for n_eval_iou in range(len(eval_seg_iou_list)):
-        results_str += '    precision@%s = %.2f\n' % \
-                       (str(eval_seg_iou_list[n_eval_iou]), seg_correct[n_eval_iou] * 100. / seg_total)
-    results_str += '    overall IoU = %.2f\n' % (cum_I * 100. / cum_U)
-    print(results_str)
+        if is_pos.any():
+            iou_pos = iou[is_pos]
+            iou_chunks.append(iou_pos.cpu())
+            cum_inter += inter[is_pos].sum()
+            cum_union += union[is_pos].sum()
+            n_pos += int(is_pos.sum().item())
 
-    return 100 * iou, 100 * cum_I / cum_U
+        neg_mask = ~is_pos
+        if neg_mask.any():
+            pred_neg_sum = pred_flat[neg_mask].sum(dim=1)
+            n_tn += int((pred_neg_sum == 0).sum().item())
+            n_neg += int(neg_mask.sum().item())
+
+    mean_iou = (torch.cat(iou_chunks).mean().item() if iou_chunks else 0.0) * 100.0
+    overall_iou = (cum_inter / cum_union).item() * 100.0 if cum_union.item() > 0 else 0.0
+    tn_rate = (n_tn / n_neg) * 100.0 if n_neg > 0 else 0.0
+
+    print(f'Final results:')
+    print(f'  Mean IoU:    {mean_iou:.2f}  ({n_pos} positive samples)')
+    print(f'  Overall IoU: {overall_iou:.2f}')
+    print(f'  TN rate:     {tn_rate:.2f}  ({n_tn}/{n_neg} negatives all-zero)')
+
+    return mean_iou, overall_iou, tn_rate
 
 
-def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, print_freq,
-                    iterations, bert_model):
+def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler,
+                    epoch, print_freq):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    train_loss = 0
-    total_its = 0
+    header = f'Epoch: [{epoch}]'
 
-    for data in metric_logger.log_every(data_loader, print_freq, header):
-        total_its += 1
-        image, target, sentences, attentions = data
-        image, target, sentences, attentions = image.cuda(non_blocking=True),\
-                                               target.cuda(non_blocking=True),\
-                                               sentences.cuda(non_blocking=True),\
-                                               attentions.cuda(non_blocking=True)
+    for image, target in metric_logger.log_every(data_loader, print_freq, header):
+        image = image.cuda(non_blocking=True)
+        target = target.cuda(non_blocking=True)
 
-        sentences = sentences.squeeze(1)
-        attentions = attentions.squeeze(1)
+        logits = model(image)
+        loss = criterion(logits, target)
 
-        if bert_model is not None:
-            last_hidden_states = bert_model(sentences, attention_mask=attentions)[0]  # (6, 10, 768)
-            embedding = last_hidden_states.permute(0, 2, 1)  # (B, 768, N_l) to make Conv1d happy
-            attentions = attentions.unsqueeze(dim=-1)  # (batch, N_l, 1)
-            output = model(image, embedding, l_mask=attentions)
-        else:
-            output = model(image, sentences, l_mask=attentions)
-
-        loss = criterion(output, target)
-        optimizer.zero_grad()  # set_to_none=True is only available in pytorch 1.6+
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
 
-        train_loss += loss.item()
-        iterations += 1
         metric_logger.update(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
 
-        del image, target, sentences, attentions, loss, output, data
-        if bert_model is not None:
-            del last_hidden_states, embedding
 
-        gc.collect()
-        torch.cuda.empty_cache()
+def _build_optimizer(single_model, args):
+    backbone_no_decay, backbone_decay = [], []
+    for name, p in single_model.backbone.named_parameters():
+        if not p.requires_grad:
+            continue
+        if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
+            backbone_no_decay.append(p)
+        else:
+            backbone_decay.append(p)
+
+    bert_params = reduce(
+        operator.concat,
+        [[p for p in single_model.text_encoder.encoder.layer[i].parameters() if p.requires_grad]
+         for i in range(10)],
+    )
+
+    params_to_optimize = [
+        {'params': backbone_no_decay, 'weight_decay': 0.0},
+        {'params': backbone_decay},
+        {'params': [p for p in single_model.classifier.parameters() if p.requires_grad]},
+        {'params': [single_model.soft_tokens]},
+        {'params': bert_params},
+    ]
+    return torch.optim.AdamW(params_to_optimize, lr=args.lr,
+                             weight_decay=args.weight_decay, amsgrad=args.amsgrad)
 
 
 def main(args):
-    dataset, num_classes = get_dataset("train",
-                                       get_transform(args=args),
-                                       args=args)
-    dataset_test, _ = get_dataset("val",
-                                  get_transform(args=args),
-                                  args=args)
-
-    # batch sampler
-    print(f"local rank {args.local_rank} / global rank {utils.get_rank()} successfully built train dataset.")
-    num_tasks = utils.get_world_size()
-    global_rank = utils.get_rank()
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=num_tasks, rank=global_rank,
-                                                                    shuffle=True)
-    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
-
-    # data loader
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size,
-        sampler=train_sampler, num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
-
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers)
-
-    # model initialization
-    print(args.model)
-    model = segmentation.__dict__[args.model](pretrained=args.pretrained_swin_weights,
-                                              args=args)
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda()
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], find_unused_parameters=True)
-    single_model = model.module
-
-    if args.model != 'lavt_one':
-        model_class = BertModel
-        bert_model = model_class.from_pretrained(args.ck_bert)
-        bert_model.pooler = None  # a work-around for a bug in Transformers = 3.0.2 that appears for DistributedDataParallel
-        bert_model.cuda()
-        bert_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(bert_model)
-        bert_model = torch.nn.parallel.DistributedDataParallel(bert_model, device_ids=[args.local_rank])
-        single_bert_model = bert_model.module
+    distributed = args.local_rank is not None and args.local_rank >= 0
+    if distributed:
+        utils.init_distributed_mode(args)
     else:
-        bert_model = None
-        single_bert_model = None
+        torch.cuda.set_device(0)
+        if args.output_dir:
+            utils.mkdir(args.output_dir)
+        if args.model_id:
+            utils.mkdir(os.path.join('./models/', args.model_id))
 
-    # resume training
+    print(f'Image size: {args.img_size}')
+    print(f'Distributed: {distributed}')
+
+    dataset_train = get_dataset('train', get_transform(args), args)
+    dataset_val = get_dataset('val', get_transform(args), args)
+
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset_train, num_replicas=utils.get_world_size(),
+            rank=utils.get_rank(), shuffle=True)
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=args.workers, pin_memory=args.pin_mem, drop_last=True)
+    else:
+        train_sampler = PatientAwareBatchSampler(
+            dataset_train, batch_size=args.batch_size,
+            drop_last=True, shuffle=True, seed=args.seed)
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, batch_sampler=train_sampler,
+            num_workers=args.workers, pin_memory=args.pin_mem)
+
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=args.pin_mem)
+
+    print(f'Built train dataset: {len(dataset_train)} samples '
+          f'({len(dataset_train.positives)} pos + {len(dataset_train.samples) - len(dataset_train.positives)} neg)')
+    print(f'Built val dataset:   {len(dataset_val)} samples')
+
+    print(f'Model: {args.model}')
+    model = segmentation.__dict__[args.model](
+        pretrained=args.pretrained_swin_weights, args=args)
+    model.cuda()
+
+    if distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.local_rank], find_unused_parameters=True)
+        single_model = model.module
+    else:
+        single_model = model
+
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
         single_model.load_state_dict(checkpoint['model'])
-        if args.model != 'lavt_one':
-            single_bert_model.load_state_dict(checkpoint['bert_model'])
 
-    # parameters to optimize
-    backbone_no_decay = list()
-    backbone_decay = list()
-    for name, m in single_model.backbone.named_parameters():
-        if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
-            backbone_no_decay.append(m)
-        else:
-            backbone_decay.append(m)
+    optimizer = _build_optimizer(single_model, args)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda x: (1 - x / (len(data_loader_train) * args.epochs)) ** 0.9,
+    )
 
-    if args.model != 'lavt_one':
-        params_to_optimize = [
-            {'params': backbone_no_decay, 'weight_decay': 0.0},
-            {'params': backbone_decay},
-            {"params": [p for p in single_model.classifier.parameters() if p.requires_grad]},
-            # the following are the parameters of bert
-            {"params": reduce(operator.concat,
-                              [[p for p in single_bert_model.encoder.layer[i].parameters()
-                                if p.requires_grad] for i in range(10)])},
-        ]
-    else:
-        params_to_optimize = [
-            {'params': backbone_no_decay, 'weight_decay': 0.0},
-            {'params': backbone_decay},
-            {"params": [p for p in single_model.classifier.parameters() if p.requires_grad]},
-            # the following are the parameters of bert
-            {"params": reduce(operator.concat,
-                              [[p for p in single_model.text_encoder.encoder.layer[i].parameters()
-                                if p.requires_grad] for i in range(10)])},
-        ]
-
-    # optimizer
-    optimizer = torch.optim.AdamW(params_to_optimize,
-                                  lr=args.lr,
-                                  weight_decay=args.weight_decay,
-                                  amsgrad=args.amsgrad
-                                  )
-
-    # learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,
-                                                     lambda x: (1 - x / (len(data_loader) * args.epochs)) ** 0.9)
-
-    # housekeeping
-    start_time = time.time()
-    iterations = 0
-    best_oIoU = -0.1
-
-    # resume training (optimizer, lr scheduler, and the epoch)
     if args.resume:
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         resume_epoch = checkpoint['epoch']
     else:
-        resume_epoch = -999
+        resume_epoch = -1
 
-    # training loops
-    for epoch in range(max(0, resume_epoch+1), args.epochs):
-        data_loader.sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler, epoch, args.print_freq,
-                        iterations, bert_model)
-        iou, overallIoU = evaluate(model, data_loader_test, bert_model)
+    criterion = FocalDiceLoss(gamma=2.0, alpha=0.75, neg_weight=0.5).cuda()
 
-        print('Average object IoU {}'.format(iou))
-        print('Overall IoU {}'.format(overallIoU))
-        save_checkpoint = (best_oIoU < overallIoU)
-        if save_checkpoint:
-            print('Better epoch: {}\n'.format(epoch))
-            if single_bert_model is not None:
-                dict_to_save = {'model': single_model.state_dict(), 'bert_model': single_bert_model.state_dict(),
-                                'optimizer': optimizer.state_dict(), 'epoch': epoch, 'args': args,
-                                'lr_scheduler': lr_scheduler.state_dict()}
-            else:
-                dict_to_save = {'model': single_model.state_dict(),
-                                'optimizer': optimizer.state_dict(), 'epoch': epoch, 'args': args,
-                                'lr_scheduler': lr_scheduler.state_dict()}
+    start_time = time.time()
+    best_overall_iou = -1.0
 
-            utils.save_on_master(dict_to_save, os.path.join(args.output_dir,
-                                                            'model_best_{}.pth'.format(args.model_id)))
-            best_oIoU = overallIoU
+    for epoch in range(max(0, resume_epoch + 1), args.epochs):
+        dataset_train.resample_negatives(epoch)
+        train_sampler.set_epoch(epoch)
 
-    # summarize
+        train_one_epoch(model, criterion, optimizer, data_loader_train,
+                        lr_scheduler, epoch, args.print_freq)
+
+        mean_iou, overall_iou, tn_rate = evaluate(model, data_loader_val)
+        print(f'Epoch {epoch}: Mean IoU={mean_iou:.2f}, Overall IoU={overall_iou:.2f}, '
+              f'TN rate={tn_rate:.2f}')
+
+        if overall_iou > best_overall_iou:
+            print(f'Better epoch: {epoch}')
+            utils.save_on_master(
+                {
+                    'model': single_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'epoch': epoch,
+                    'args': args,
+                },
+                os.path.join(args.output_dir, f'model_best_{args.model_id}.pth'),
+            )
+            best_overall_iou = overall_iou
+
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print(f'Training time {datetime.timedelta(seconds=int(total_time))}')
 
 
 if __name__ == "__main__":
     from args import get_parser
     parser = get_parser()
     args = parser.parse_args()
-    # set up distributed learning
-    utils.init_distributed_mode(args)
-    print('Image size: {}'.format(str(args.img_size)))
     main(args)
