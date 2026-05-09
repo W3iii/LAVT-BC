@@ -74,14 +74,15 @@ class _LAVTOneSimpleDecode(nn.Module):
         cls_id, sep_id = tokenizer.cls_token_id, tokenizer.sep_token_id
 
         adjs = _select_init_adjectives(n_soft)
-        adj_token_ids = []
-        for adj in adjs:
-            ids = tokenizer.encode(adj, add_special_tokens=False)
-            assert len(ids) == 1, (
-                f"Init adjective '{adj}' must tokenize to a single BERT "
-                f"wordpiece, got {ids}"
-            )
-            adj_token_ids.append(ids[0])
+        # Tokenize the whole adjective phrase and pad/truncate to exactly
+        # n_soft tokens. Robust to cased tokenizers (e.g. BioBERT) that may
+        # split a lowercase adjective into multiple wordpieces.
+        adj_token_ids = tokenizer.encode(" ".join(adjs), add_special_tokens=False)
+        if len(adj_token_ids) >= n_soft:
+            adj_token_ids = adj_token_ids[:n_soft]
+        else:
+            pad_id = adj_token_ids[-1] if adj_token_ids else tokenizer.unk_token_id
+            adj_token_ids = adj_token_ids + [pad_id] * (n_soft - len(adj_token_ids))
 
         prefix_full = [cls_id] + prefix_ids
         suffix_full = suffix_ids + [sep_id]
