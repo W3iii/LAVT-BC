@@ -33,8 +33,8 @@ class LAVT(_LAVTSimpleDecode):
 # Single-token adjectives used to seed the soft prompt embeddings.
 # Each must tokenize to exactly one BERT wordpiece in bert-base-uncased.
 _INIT_ADJECTIVES = [
-    "small", "round", "irregular", "dense",
-    "bright", "suspicious", "malignant", "abnormal",
+    "small", "irregular", "suspicious", "abnormal",
+    "round", "dense", "bright", "malignant",
 ]
 _PREFIX_TEXT = "a slice of chest ct with"
 _SUFFIX_TEXT = "lung nodule"
