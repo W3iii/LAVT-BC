@@ -25,7 +25,7 @@ class LungNoduleDataset(data.Dataset):
     """
 
     def __init__(self, data_root, split, transforms,
-                 neg_ratio: float = 0.1, seed: int = 42):
+                 neg_ratio: float = 0.3, seed: int = 42):
         self.data_root = Path(data_root)
         self.split = split
         self.transforms = transforms
