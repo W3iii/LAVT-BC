@@ -1,0 +1,33 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Image files
+*.png
+*.jpg
+*.jpeg
+*.PNG
+*.JPG
+*.JPEG
+
+# Training artifacts
+checkpoints/
+models/
+pred_results/
+language_disc_results/
+pretrained_weights/
+*.pth
+*.bin
+*.safetensors
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
