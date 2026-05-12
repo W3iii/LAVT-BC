@@ -25,11 +25,13 @@ class LungNoduleDataset(data.Dataset):
     """
 
     def __init__(self, data_root, split, transforms,
-                 neg_ratio: float = 0.3, seed: int = 42):
+                 neg_ratio: float = 0.3, seed: int = 42,
+                 return_meta: bool = False):
         self.data_root = Path(data_root)
         self.split = split
         self.transforms = transforms
         self.neg_ratio = neg_ratio
+        self.return_meta = return_meta
         self.images_dir = self.data_root / "images" / split
         self.masks_dir = self.data_root / "masks" / split
 
@@ -70,4 +72,6 @@ class LungNoduleDataset(data.Dataset):
             target = Image.open(self.masks_dir / ann["mask"])
         if self.transforms is not None:
             img, target = self.transforms(img, target)
+        if self.return_meta:
+            return img, target, ann
         return img, target

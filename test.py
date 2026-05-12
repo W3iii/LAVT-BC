@@ -1,7 +1,9 @@
-import torch
-import torch.utils.data
+import os
 
 import numpy as np
+import torch
+import torch.utils.data
+from PIL import Image
 
 from lib import segmentation
 from data.dataset_lung_nodule import LungNoduleDataset
@@ -17,11 +19,24 @@ def get_transform(args):
     ])
 
 
+def _save_predictions(pred: torch.Tensor, ann_batch: dict, pred_dir: str) -> None:
+    # pred: (B, H, W) {0, 1}; ann_batch: dict-of-lists from default collate.
+    images = ann_batch["image"]
+    pred_np = (pred.cpu().numpy().astype(np.uint8) * 255)
+    for i, fname in enumerate(images):
+        stem = os.path.splitext(fname)[0]
+        Image.fromarray(pred_np[i]).save(os.path.join(pred_dir, f"{stem}_pred.png"))
+
+
 @torch.no_grad()
-def evaluate(model, data_loader, device):
+def evaluate(model, data_loader, device, args):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
+
+    if args.save_pred:
+        os.makedirs(args.pred_dir, exist_ok=True)
+        print(f'Saving predictions to {args.pred_dir}')
 
     iou_thresholds = [0.5, 0.6, 0.7, 0.8, 0.9]
     seg_correct = np.zeros(len(iou_thresholds), dtype=np.int64)
@@ -31,12 +46,21 @@ def evaluate(model, data_loader, device):
     cum_union = torch.zeros((), dtype=torch.float64, device=device)
     n_pos, n_neg, n_tn = 0, 0, 0
 
-    for image, target in metric_logger.log_every(data_loader, 100, header):
+    for batch in metric_logger.log_every(data_loader, 100, header):
+        if args.save_pred:
+            image, target, ann_batch = batch
+        else:
+            image, target = batch
+            ann_batch = None
+
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
         logits = model(image)                          # (B, 2, H, W)
         pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
+
+        if args.save_pred:
+            _save_predictions(pred, ann_batch, args.pred_dir)
 
         target_flat = target.flatten(1)
         pred_flat = pred.flatten(1)
@@ -84,6 +108,7 @@ def main(args):
         transforms=get_transform(args),
         neg_ratio=args.neg_ratio,
         seed=args.seed,
+        return_meta=args.save_pred,
     )
     data_loader = torch.utils.data.DataLoader(
         dataset_test, batch_size=args.batch_size, shuffle=False,
@@ -100,7 +125,7 @@ def main(args):
     model.load_state_dict(checkpoint['model'])
     model.to(device)
 
-    evaluate(model, data_loader, device=device)
+    evaluate(model, data_loader, device=device, args=args)
 
 
 if __name__ == "__main__":

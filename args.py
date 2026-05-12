@@ -30,6 +30,10 @@ def get_parser():
     parser.add_argument('--n_soft_tokens', default=4, type=int,
                         help='number of learnable soft prompt tokens')
     parser.add_argument('--output-dir', default='./checkpoints/', help='path where to save checkpoint weights')
+    parser.add_argument('--pred_dir', default='./pred_results',
+                        help='where test.py writes prediction masks when --save_pred is set')
+    parser.add_argument('--save_pred', action='store_true',
+                        help='if set, test.py saves per-sample predicted masks as PNG')
     parser.add_argument('--pin_mem', action='store_true',
                         help='If true, pin memory when using the data loader.')
     parser.add_argument('--pretrained_swin_weights', default='',
