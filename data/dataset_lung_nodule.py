@@ -44,6 +44,10 @@ class LungNoduleDataset(data.Dataset):
         self.resample_negatives(epoch=0)
 
     def resample_negatives(self, epoch: int) -> None:
+        # neg_ratio < 0 -> use the full negative pool (test/eval mode).
+        if self.neg_ratio < 0:
+            self.samples = self.positives + list(self.neg_pool)
+            return
         rng = random.Random(self._base_seed + epoch)
         n_neg = int(len(self.positives) * self.neg_ratio)
         n_neg = min(n_neg, len(self.neg_pool))
