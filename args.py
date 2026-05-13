@@ -44,6 +44,14 @@ def get_parser():
     parser.add_argument('--split', default='val', help='only used when testing')
     parser.add_argument('--swin_type', default='base',
                         help='tiny, small, base, or large variants of the Swin Transformer')
+    parser.add_argument('--inference_mode', default='dual_suppression',
+                        choices=['positive', 'dual_suppression'],
+                        help='test-time prompting mode; dual_suppression runs both prompts '
+                             'and combines via score_pos - lambda_neg * score_neg')
+    parser.add_argument('--lambda_neg', default=0.3, type=float,
+                        help='negative-prompt suppression weight used in dual_suppression mode')
+    parser.add_argument('--score_threshold', default=0.5, type=float,
+                        help='binarization threshold on the combined score (sigmoid/softmax-prob scale)')
     parser.add_argument('--wd', '--weight-decay', default=1e-2, type=float, metavar='W', help='weight decay',
                         dest='weight_decay')
     parser.add_argument('--window12', action='store_true',

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 from PIL import Image
 from scipy.ndimage import label as cc_label
@@ -152,16 +153,27 @@ def evaluate(model, data_loader, device, args):
 
     for batch in metric_logger.log_every(data_loader, 100, header):
         if args.save_pred:
-            image, target, ann_batch = batch
+            image, target, _has_nodule, ann_batch = batch
         else:
-            image, target = batch
+            image, target, _has_nodule = batch
             ann_batch = None
 
         image = image.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        logits = model(image)
-        pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
+        if args.inference_mode == 'positive':
+            logits_pos = model(image, prompt_type='positive')
+            final_score = F.softmax(logits_pos, dim=1)[:, 1]
+        elif args.inference_mode == 'dual_suppression':
+            logits_pos = model(image, prompt_type='positive')
+            logits_neg = model(image, prompt_type='negative')
+            score_pos = F.softmax(logits_pos, dim=1)[:, 1]
+            score_neg = F.softmax(logits_neg, dim=1)[:, 1]
+            final_score = score_pos - args.lambda_neg * score_neg
+        else:
+            raise ValueError(f"Unknown inference_mode: {args.inference_mode}")
+
+        pred = (final_score > args.score_threshold).long()  # (B, H, W) {0, 1}
 
         if args.save_pred:
             for i in range(pred.shape[0]):
@@ -259,6 +271,11 @@ def main(args):
     print(f'Model: {args.model}')
     print(f'Test split "{args.split}": {len(dataset_test)} samples '
           f'({len(dataset_test.positives)} pos + {n_neg_in_set} neg)')
+    if args.inference_mode == 'dual_suppression':
+        print(f'Inference: dual_suppression  '
+              f'(lambda_neg={args.lambda_neg}, threshold={args.score_threshold})')
+    else:
+        print(f'Inference: positive  (threshold={args.score_threshold})')
 
     model = segmentation.__dict__[args.model](pretrained='', args=args)
     checkpoint = torch.load(args.resume, map_location='cpu')

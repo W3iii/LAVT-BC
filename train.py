@@ -5,6 +5,7 @@ from functools import reduce
 import operator
 
 import torch
+import torch.nn.functional as F
 import torch.utils.data
 
 from lib import segmentation
@@ -35,7 +36,7 @@ def get_dataset(split, transform, args):
 
 
 @torch.no_grad()
-def evaluate(model, data_loader):
+def evaluate(model, data_loader, lambda_neg: float, score_threshold: float):
     model.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
@@ -47,12 +48,17 @@ def evaluate(model, data_loader):
     n_neg = 0
     n_tn = 0
 
-    for image, target in metric_logger.log_every(data_loader, 100, header):
+    for image, target, _has_nodule in metric_logger.log_every(data_loader, 100, header):
         image = image.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)        # (B, H, W) {0, 1}
 
-        logits = model(image)                          # (B, 2, H, W)
-        pred = logits.argmax(dim=1)                    # (B, H, W) {0, 1}
+        # Validation reflects deployment: dual-prompt suppression on softmax probs.
+        logits_pos = model(image, prompt_type='positive')     # (B, 2, H, W)
+        logits_neg = model(image, prompt_type='negative')
+        score_pos = F.softmax(logits_pos, dim=1)[:, 1]
+        score_neg = F.softmax(logits_neg, dim=1)[:, 1]
+        final_score = score_pos - lambda_neg * score_neg
+        pred = (final_score > score_threshold).long()         # (B, H, W) {0, 1}
 
         target_flat = target.flatten(1)
         pred_flat = pred.flatten(1)
@@ -94,11 +100,12 @@ def train_one_epoch(model, criterion, optimizer, data_loader, lr_scheduler,
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value}'))
     header = f'Epoch: [{epoch}]'
 
-    for image, target in metric_logger.log_every(data_loader, print_freq, header):
+    for image, target, has_nodule in metric_logger.log_every(data_loader, print_freq, header):
         image = image.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
+        has_nodule = has_nodule.cuda(non_blocking=True)
 
-        logits = model(image)
+        logits = model(image, has_nodule=has_nodule)
         loss = criterion(logits, target)
 
         optimizer.zero_grad()
@@ -129,7 +136,7 @@ def _build_optimizer(single_model, args):
         {'params': backbone_no_decay, 'weight_decay': 0.0},
         {'params': backbone_decay},
         {'params': [p for p in single_model.classifier.parameters() if p.requires_grad]},
-        {'params': [single_model.soft_tokens]},
+        {'params': [single_model.pos_soft_tokens, single_model.neg_soft_tokens]},
         {'params': bert_params},
     ]
     return torch.optim.AdamW(params_to_optimize, lr=args.lr,
@@ -218,7 +225,11 @@ def main(args):
         train_one_epoch(model, criterion, optimizer, data_loader_train,
                         lr_scheduler, epoch, args.print_freq)
 
-        mean_iou, overall_iou, tn_rate = evaluate(model, data_loader_val)
+        mean_iou, overall_iou, tn_rate = evaluate(
+            model, data_loader_val,
+            lambda_neg=args.lambda_neg,
+            score_threshold=args.score_threshold,
+        )
         print(f'Epoch {epoch}: Mean IoU={mean_iou:.2f}, Overall IoU={overall_iou:.2f}, '
               f'TN rate={tn_rate:.2f}')
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1
+MODEL_ID=lavt_one_ln_v2_dual_prompts
 CKPT=./checkpoints/${MODEL_ID}/model_best_${MODEL_ID}.pth
 
 CUDA_VISIBLE_DEVICES=0 python test.py \
@@ -19,5 +19,8 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
     --pin_mem \
     --neg_ratio=-1 \
     --n_soft_tokens 4 \
+    --inference_mode dual_suppression \
+    --lambda_neg 0.3 \
+    --score_threshold 0.5 \
     --resume ${CKPT} \
     2>&1 | tee ./models/${MODEL_ID}/test_output

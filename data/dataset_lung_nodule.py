@@ -2,6 +2,7 @@ import json
 import random
 from pathlib import Path
 
+import torch
 import torch.utils.data as data
 from PIL import Image
 
@@ -72,6 +73,7 @@ class LungNoduleDataset(data.Dataset):
             target = Image.open(self.masks_dir / ann["mask"])
         if self.transforms is not None:
             img, target = self.transforms(img, target)
+        has_nodule = torch.tensor(ann["mask"] != "empty", dtype=torch.bool)
         if self.return_meta:
-            return img, target, ann
-        return img, target
+            return img, target, has_nodule, ann
+        return img, target, has_nodule

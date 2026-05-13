@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_ID=lavt_one_ln_v1
+MODEL_ID=lavt_one_ln_v2_dual_prompts
 
 mkdir -p ./models/${MODEL_ID}
 mkdir -p ./checkpoints/
@@ -18,12 +18,14 @@ CUDA_VISIBLE_DEVICES=0 python train.py \
     --swin_type base \
     --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth \
     --window12 \
-    --epochs 50 \
+    --epochs 100 \
     --img_size 512 \
     --workers 4 \
     --pin_mem \
     --output-dir ./checkpoints/${MODEL_ID} \
     --neg_ratio 0.3 \
     --n_soft_tokens 4 \
+    --lambda_neg 0.3 \
+    --score_threshold 0.5 \
     --seed 42 \
     2>&1 | tee ./models/${MODEL_ID}/output

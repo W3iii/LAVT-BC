@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set MODEL_ID=lavt_one_ln_v1
+set MODEL_ID=lavt_one_ln_v2_dual_prompts
 set CKPT=.\checkpoints\%MODEL_ID%\model_best_%MODEL_ID%.pth
 
 python test.py ^
@@ -18,6 +18,9 @@ python test.py ^
     --workers 4 ^
     --neg_ratio=-1 ^
     --n_soft_tokens 4 ^
+    --inference_mode dual_suppression ^
+    --lambda_neg 0.3 ^
+    --score_threshold 0.5 ^
     --resume %CKPT% ^
     --save_pred ^
     --pred_dir .\pred_results\%MODEL_ID%
