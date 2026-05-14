@@ -39,7 +39,6 @@ def get_transform(args, is_train: bool):
     if is_train:
         transforms.extend([
             T.RandomHorizontalFlip(0.5),
-            T.RandomVerticalFlip(0.3),
             T.RandomMildAffine(prob=0.5, degrees=7.0,
                                translate_px=10,
                                scale_range=(0.95, 1.05)),
