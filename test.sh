@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=0 python test.py \
     --swin_type base \
     --pretrained_swin_weights ./pretrained_weights/swin_base_patch4_window12_384_22k.pth \
     --window12 \
-    --img_h 384 \
+    --img_h 512 \
     --img_w 512 \
     --workers 4 \
     --pin_mem \

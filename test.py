@@ -34,7 +34,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 def get_transform(args):
     img_h, img_w = get_input_size(args)
     return T.Compose([
-        T.PadOrCropToSize(img_h, img_w, image_fill=0, target_fill=0),
+        T.Resize(img_h, img_w),
         T.ToTensor(),
         T.Clip01(),
         T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -97,8 +97,8 @@ def _greedy_match(score_mat: np.ndarray, thr: float) -> tuple:
 def _save_overlay(image_path: Path, mask_path, pred: torch.Tensor,
                   out_path: Path, output_size: tuple) -> None:
     """
-    Draw GT (green) and pred (red) contours on the same deterministic
-    pad/crop canvas used by validation/test transforms.
+    Draw GT (green) and pred (red) contours on the same resized canvas
+    used by validation/test transforms.
     """
     out_h, out_w = output_size
     img = Image.open(image_path).convert("L")
@@ -107,7 +107,7 @@ def _save_overlay(image_path: Path, mask_path, pred: torch.Tensor,
     else:
         gt = Image.open(mask_path).convert("L")
 
-    fit = T.PadOrCropToSize(out_h, out_w, image_fill=0, target_fill=0)
+    fit = T.Resize(out_h, out_w)
     img, gt = fit(img, gt)
 
     img_np = np.array(img, dtype=np.uint8)

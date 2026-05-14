@@ -34,7 +34,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 def get_transform(args, is_train: bool):
     img_h, img_w = get_input_size(args)
     transforms = [
-        T.PadOrCropToSize(img_h, img_w, image_fill=0, target_fill=0),
+        T.Resize(img_h, img_w),
     ]
     if is_train:
         transforms.extend([
