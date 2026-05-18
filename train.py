@@ -222,7 +222,7 @@ def main(args):
     else:
         resume_epoch = -1
 
-    criterion = FocalDiceLoss(gamma=2.0, alpha=0.75, neg_weight=0.5).cuda()
+    criterion = FocalDiceLoss(gamma=2.0, alpha=0.9, neg_weight=0.1).cuda()
 
     start_time = time.time()
     best_overall_iou = -1.0
