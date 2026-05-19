@@ -35,29 +35,16 @@ def get_transform(args, is_train: bool):
     img_h, img_w = get_input_size(args)
     transforms = [T.Resize(img_h, img_w)]
     if is_train:
-        # PIL-stage augment (works on PIL Image, before ToTensor).
-        transforms.append(
+        # Geometry-only augment. Intensity augments removed — under BN
+        # they widen the train pixel-value distribution and pollute the
+        # running stats, breaking eval-mode predictions.
+        transforms.extend([
             T.SpatialTransform2D(rotation_deg=15.0,
                                  scaling_range=(0.7, 1.4),
                                  p_rotation=0.2, p_scaling=0.2),
-        )
-    transforms.append(T.ToTensor())
-    if is_train:
-        # Tensor-stage augment (needs PyTorch ops). nnUNet v2 order:
-        # Noise → Blur → MultBrightness → Contrast → SimLowRes →
-        # GammaInverted → Gamma → Mirror.
-        transforms.extend([
-            T.RandomGaussianNoiseV2(prob=0.1, max_variance=0.01),
-            T.RandomGaussianBlurTensor(prob=0.2, sigma_range=(0.5, 1.0)),
-            T.RandomMultiplicativeBrightness(prob=0.15,
-                                             multiplier_range=(0.75, 1.25)),
-            T.RandomContrast(prob=0.15, contrast_range=(0.75, 1.25)),
-            T.RandomGammaTransform(prob=0.1, gamma_range=(0.7, 1.5),
-                                   invert=True, retain_stats=True),
-            T.RandomGammaTransform(prob=0.3, gamma_range=(0.7, 1.5),
-                                   invert=False, retain_stats=True),
             T.RandomHorizontalFlip(0.5),
         ])
+    transforms.append(T.ToTensor())
     transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
     return T.Compose(transforms)
 
