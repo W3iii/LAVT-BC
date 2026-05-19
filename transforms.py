@@ -3,6 +3,7 @@ from PIL import Image, ImageFilter, ImageOps
 import random
 
 import torch
+import torch.nn.functional as Fnn
 from torchvision import transforms as T
 from torchvision.transforms import functional as F
 
@@ -286,5 +287,177 @@ class Normalize(object):
 
     def __call__(self, image, target):
         image = F.normalize(image, mean=self.mean, std=self.std)
+        return image, target
+
+
+# ── nnUNet v2-style augmentation (2D) ──────────────────────────────────────
+# Pipeline order mirrors get_training_transforms() in nnUNetv2:
+#   SpatialTransform → GaussianNoise → GaussianBlur →
+#   MultiplicativeBrightness → Contrast → SimulateLowResolution →
+#   GammaInverted → Gamma → Mirror
+# Probabilities and ranges match nnUNetv2 defaults except Mirror (H-only)
+# and rotation (±15° instead of ±180°) per chest CT anatomy.
+
+
+class SpatialTransform2D(object):
+    """Rotation + scaling on the model-input canvas. fill=0 in image and mask.
+
+    Rotation and scaling roll independently (matches nnUNet v2's
+    p_rotation / p_scaling). Pure pixel translation is NOT applied
+    (nnUNet uses patch_center_dist_from_border=0 with random_crop=False,
+    which leaves the center fixed).
+    """
+
+    def __init__(self, rotation_deg=15.0, scaling_range=(0.7, 1.4),
+                 p_rotation=0.2, p_scaling=0.2):
+        self.rotation_deg = rotation_deg
+        self.scaling_range = scaling_range
+        self.p_rotation = p_rotation
+        self.p_scaling = p_scaling
+
+    def __call__(self, image, target):
+        angle = 0.0
+        scale = 1.0
+        if random.random() < self.p_rotation:
+            angle = random.uniform(-self.rotation_deg, self.rotation_deg)
+        if random.random() < self.p_scaling:
+            scale = random.uniform(*self.scaling_range)
+
+        if angle == 0.0 and scale == 1.0:
+            return image, target
+
+        image = _affine_with_fill(image, angle, [0, 0], scale, [0.0, 0.0],
+                                  Image.BILINEAR, 0)
+        target = _affine_with_fill(target, angle, [0, 0], scale, [0.0, 0.0],
+                                   Image.NEAREST, 0)
+        return image, target
+
+
+class RandomGaussianNoiseV2(object):
+    """nnUNet-style additive Gaussian noise. variance ~ U(0, max_variance)."""
+
+    def __init__(self, prob=0.1, max_variance=0.1):
+        self.prob = prob
+        self.max_variance = max_variance
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            variance = random.uniform(0.0, self.max_variance)
+            std = variance ** 0.5
+            image = image + torch.randn_like(image) * std
+            image = image.clamp(0.0, 1.0)
+        return image, target
+
+
+class RandomGaussianBlurTensor(object):
+    """Per-call sigma; nnUNet uses sigma ~ U(0.5, 1.0) with p=0.2."""
+
+    def __init__(self, prob=0.2, sigma_range=(0.5, 1.0), kernel_size=5):
+        self.prob = prob
+        self.sigma_range = sigma_range
+        self.kernel_size = kernel_size
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            sigma = random.uniform(*self.sigma_range)
+            image = F.gaussian_blur(image, kernel_size=self.kernel_size,
+                                    sigma=sigma)
+        return image, target
+
+
+class RandomMultiplicativeBrightness(object):
+    def __init__(self, prob=0.15, multiplier_range=(0.75, 1.25)):
+        self.prob = prob
+        self.multiplier_range = multiplier_range
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            mult = random.uniform(*self.multiplier_range)
+            image = (image * mult).clamp(0.0, 1.0)
+        return image, target
+
+
+class RandomContrast(object):
+    """(img - mean) * factor + mean, clipped to original range."""
+
+    def __init__(self, prob=0.15, contrast_range=(0.75, 1.25),
+                 preserve_range=True):
+        self.prob = prob
+        self.contrast_range = contrast_range
+        self.preserve_range = preserve_range
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            factor = random.uniform(*self.contrast_range)
+            mean = image.mean()
+            if self.preserve_range:
+                lo, hi = image.min().item(), image.max().item()
+            image = (image - mean) * factor + mean
+            if self.preserve_range:
+                image = image.clamp(lo, hi)
+        return image, target
+
+
+class RandomSimulateLowResolution(object):
+    """Downsample with nearest then upsample with bicubic — mimics
+    scanner low-res artifacts. Mask is left untouched."""
+
+    def __init__(self, prob=0.25, scale_range=(0.5, 1.0)):
+        self.prob = prob
+        self.scale_range = scale_range
+
+    def __call__(self, image, target):
+        if random.random() < self.prob:
+            scale = random.uniform(*self.scale_range)
+            if scale >= 0.999:
+                return image, target
+            _, h, w = image.shape
+            new_h = max(1, int(round(h * scale)))
+            new_w = max(1, int(round(w * scale)))
+            img = image.unsqueeze(0)
+            img = Fnn.interpolate(img, size=(new_h, new_w), mode='nearest')
+            img = Fnn.interpolate(img, size=(h, w), mode='bicubic',
+                                  align_corners=False)
+            image = img.squeeze(0).clamp(0.0, 1.0)
+        return image, target
+
+
+class RandomGammaTransform(object):
+    """Gamma correction. If ``invert``, applies on inverted image then
+    inverts back (nnUNet's GammaInverted variant).
+
+    Retain-stats matches nnUNet: re-normalize output to the input
+    image's pre-gamma mean/std.
+    """
+
+    def __init__(self, prob=0.3, gamma_range=(0.7, 1.5),
+                 invert=False, retain_stats=True):
+        self.prob = prob
+        self.gamma_range = gamma_range
+        self.invert = invert
+        self.retain_stats = retain_stats
+
+    def __call__(self, image, target):
+        if random.random() >= self.prob:
+            return image, target
+
+        gamma = random.uniform(*self.gamma_range)
+        if self.retain_stats:
+            mean_in = image.mean()
+            std_in = image.std()
+
+        if self.invert:
+            image = 1.0 - image
+
+        image = image.clamp(min=1e-7).pow(gamma)
+
+        if self.invert:
+            image = 1.0 - image
+
+        if self.retain_stats:
+            mean_out = image.mean()
+            std_out = image.std().clamp(min=1e-7)
+            image = (image - mean_out) / std_out * std_in + mean_in
+            image = image.clamp(0.0, 1.0)
         return image, target
 

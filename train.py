@@ -31,13 +31,36 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def get_transform(args):
+def get_transform(args, is_train: bool):
     img_h, img_w = get_input_size(args)
-    return T.Compose([
-        T.Resize(img_h, img_w),
-        T.ToTensor(),
-        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ])
+    transforms = [T.Resize(img_h, img_w)]
+    if is_train:
+        # PIL-stage augment (works on PIL Image, before ToTensor).
+        transforms.append(
+            T.SpatialTransform2D(rotation_deg=15.0,
+                                 scaling_range=(0.7, 1.4),
+                                 p_rotation=0.2, p_scaling=0.2),
+        )
+    transforms.append(T.ToTensor())
+    if is_train:
+        # Tensor-stage augment (needs PyTorch ops). nnUNet v2 order:
+        # Noise → Blur → MultBrightness → Contrast → SimLowRes →
+        # GammaInverted → Gamma → Mirror.
+        transforms.extend([
+            T.RandomGaussianNoiseV2(prob=0.1, max_variance=0.1),
+            T.RandomGaussianBlurTensor(prob=0.2, sigma_range=(0.5, 1.0)),
+            T.RandomMultiplicativeBrightness(prob=0.15,
+                                             multiplier_range=(0.75, 1.25)),
+            T.RandomContrast(prob=0.15, contrast_range=(0.75, 1.25)),
+            T.RandomSimulateLowResolution(prob=0.25, scale_range=(0.5, 1.0)),
+            T.RandomGammaTransform(prob=0.1, gamma_range=(0.7, 1.5),
+                                   invert=True, retain_stats=True),
+            T.RandomGammaTransform(prob=0.3, gamma_range=(0.7, 1.5),
+                                   invert=False, retain_stats=True),
+            T.RandomHorizontalFlip(0.5),
+        ])
+    transforms.append(T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    return T.Compose(transforms)
 
 
 def get_dataset(split, transform, args):
@@ -166,8 +189,8 @@ def main(args):
     print(f'Image size: {format_input_size(args)}')
     print(f'Distributed: {distributed}')
 
-    dataset_train = get_dataset('train', get_transform(args), args)
-    dataset_val = get_dataset('val', get_transform(args), args)
+    dataset_train = get_dataset('train', get_transform(args, is_train=True), args)
+    dataset_val = get_dataset('val', get_transform(args, is_train=False), args)
 
     if distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
